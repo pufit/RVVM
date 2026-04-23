@@ -956,19 +956,52 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
             if (stream->bdl_len > 0 && stream->lpib > stream->bdl_len)
                 atomic_store_uint32_relax(&stream->running, 0);
             if (ioc) {
-                // Latch BCIS (SDnSTS bit 2) before raising the IRQ. Linux's
-                // HDA ISR (snd_hdac_bus_handle_stream_irq) reads SD_STS,
-                // and only calls snd_pcm_period_elapsed when SD_INT_COMPLETE
-                // (== BCIS) is set. Without this bit, the IRQ is ack'd and
-                // discarded — hw_ptr stops advancing from the driver's POV,
-                // writers blocked in wait_for_avail never wake, and the
-                // stream decays into a stall that userspace sees as short
-                // or zero writes from snd_pcm_writei.
+                // Latch BCIS (SDnSTS bit 2) unconditionally so INTSTS
+                // reflects the real event — the guest clears it via RW1C
+                // on OSD0STS (sound_hda_mmio_write). HDA spec 3.3.38
+                // mandates latching here; the interrupt-enable gates below
+                // control only whether the PCI IRQ line is asserted, not
+                // whether the status bit latches. Linux's HDA ISR
+                // (snd_hdac_bus_handle_stream_irq) reads SD_STS and only
+                // calls snd_pcm_period_elapsed when SD_INT_COMPLETE
+                // (== BCIS) is set — without this latch, hw_ptr would
+                // stop advancing from the driver's POV and writers blocked
+                // in wait_for_avail would never wake.
                 //
-                // HDA spec 3.3.38: BCIS is RW1C. Guest clears it via the
-                // existing OSD0STS write handler at sound_hda_mmio_write().
+                // Serialize the latch against the MMIO-side reader/clearer
+                // (sound_hda_mmio_read/_write hold hda->lock while touching
+                // stream_output.status at offsets OSD0STS/INTSTS). Without
+                // the lock this is a torn-byte race that can drop a newly-
+                // set BCIS under an in-flight clear and lose the period IRQ.
+                spin_lock(&hda->lock);
                 hda->stream_output.status |= 0x04;
-                pci_send_irq(hda->pci_func, 0);
+                // Gate the PCI IRQ raise on the guest-published enables
+                // (HDA spec 3.3.14 / 3.3.36):
+                //
+                //   IOCE  — SDnCTL bit 2, per-stream "raise IRQ on BDL IOC"
+                //   SIE   — INTCTL bit N, per-stream interrupt enable
+                //           (N = stream index in ISS/OSS/BSS order; OSD0 = 1)
+                //   GIE   — INTCTL bit 31, controller-global interrupt enable
+                //
+                // All three must be set for the stream's IOC event to drive
+                // the PCI INTx/MSI line. Ignoring them was benign before
+                // commit 3286526 because INTSTS returned a mis-indexed bit
+                // that Linux's azx_interrupt silently discarded — so IRQs
+                // we raised were never observed. With INTSTS corrected,
+                // Linux's ISR actually runs on every raise, and raising
+                // after the guest has disabled interrupts (stream close,
+                // suspend, etc.) produces a spurious IRQ cascade that
+                // preempts the guest vCPU while its ALSA teardown path
+                // holds hda->lock via MMIO — a self-contended freeze
+                // reported as "the VM locks up when aplay is Ctrl+C'd".
+                uint8_t  ioce = stream->ioce;
+                uint32_t ic   = hda->intr_ctrl;
+                spin_unlock(&hda->lock);
+                bool gie = (ic & (1u << 31)) != 0;
+                bool sie = (ic & (1u << 1))  != 0;  // OSD0 = stream index 1
+                if (ioce && gie && sie) {
+                    pci_send_irq(hda->pci_func, 0);
+                }
             }
         }
     }
