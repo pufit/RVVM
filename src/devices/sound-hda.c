@@ -998,7 +998,13 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
                 uint32_t ic   = hda->intr_ctrl;
                 spin_unlock(&hda->lock);
                 bool gie = (ic & (1u << 31)) != 0;
-                bool sie = (ic & (1u << 1))  != 0;  // OSD0 = stream index 1
+                // TODO: hardcoded OSD0 = stream index 1. The worker only
+                // services the single output stream today, but if input
+                // (ISDn) or additional output streams get wired, this gate
+                // needs to consult the per-stream INTCTL bit derived from
+                // the actual stream index (ISS+OSS+BSS layout per spec
+                // 3.3.14), not a literal 1.
+                bool sie = (ic & (1u << 1))  != 0;
                 if (ioce && gie && sie) {
                     pci_send_irq(hda->pci_func, 0);
                 }
