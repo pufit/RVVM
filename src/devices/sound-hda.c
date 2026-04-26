@@ -302,6 +302,7 @@ typedef struct {
     uint32_t    bdl_len;
     uint32_t    lpib;
     uint8_t     ioce;
+    uint8_t     srst;          // SDnCTL bit 0: stream reset (mirrors guest write)
     uint8_t     stream;
     uint8_t     channel;
     uint32_t    running;       // Guest intent: 1 = stream should be running
@@ -528,8 +529,9 @@ static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset,
         // of uninitialised-stack contents.
         case SOUND_HDA_OSD0CTL: {
             // 24-bit register (3 bytes at SD_CTL..SD_CTL+2). Linux reads
-            // 1 byte for SD_CTL (RUN/IOCE/FEIE/DEIE/TP bits).
+            // 1 byte for SD_CTL (SRST/RUN/IOCE/FEIE/DEIE/TP bits).
             uint8_t ctl = 0;
+            ctl |= (hda->stream_output.srst & 1u) << 0;
             ctl |= (atomic_load_uint32_relax(&hda->stream_output.running) ? 1u : 0u) << 1;
             ctl |= (hda->stream_output.ioce & 1u) << 2;
             // Bits 23:20 carry the guest-assigned stream number — used
@@ -1100,10 +1102,19 @@ static void *sound_hda_stream_worker(void *arg)
 
 static void sound_hda_output_stream_ctl(sound_hda_dev_t *hda, uint32_t cmd)
 {
+    uint8_t srst = (cmd >> 0) & 1;
     uint8_t ioce = (cmd >> 2) & 1;
     uint8_t run  = (cmd >> 1) & 1;
 
     sound_hda_stream_t *stream = &hda->stream_output;
+    // Track SRST so SDnCTL reads reflect it back. HDA spec 3.3.35: writing
+    // SRST=1 enters reset; the controller must report SRST=1 in subsequent
+    // reads so software's reset-entry poll succeeds, then writing SRST=0
+    // exits reset and reads return SRST=0. Linux's snd_hdac_stream_reset()
+    // (sound/hda/hdac_stream.c) polls up to 300×3μs for each transition;
+    // without mirroring SRST, both polls time out silently and stream
+    // init stalls — visible as "card detected but plays no audio".
+    stream->srst = srst;
     stream->ioce = ioce;
 
     if (run) {
