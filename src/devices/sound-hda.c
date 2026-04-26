@@ -362,7 +362,13 @@ typedef struct {
     uint8_t     channel;
     uint32_t    running;       // Guest intent: 1 = stream should be running
     uint32_t    worker_alive;  // Worker lifetime: 1 = worker thread exists
-    uint8_t     fmt;
+    uint16_t    fmt;           // SDnFMT register (HDA spec 7.3.3.10): full 16
+                               // bits — channels(0:3), size(4:6), divisor(8:10),
+                               // multiplier(11:13), base(14). Worker reads this
+                               // to derive the pacing rate; truncating to 8 bits
+                               // loses divisor / multiplier / base and leaves the
+                               // worker pacing as 48 kHz 8-bit mono regardless of
+                               // what the guest configured.
     uint8_t     status;
     uint8_t     left_gain;
     uint8_t     right_gain;
@@ -1322,8 +1328,17 @@ static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset
             hda->stream_output.bdl_lvi = read_uint32_le(data);
             break;
         case SOUND_HDA_OSD0FMT:
-            // Maybe useful, but guest already plays sound
-            // with different sample rates correctly.
+            // Store the full 16-bit SDnFMT value so the stream worker can
+            // derive bytes-per-frame and sample rate from it (HDA spec
+            // 7.3.3.10: channels in bits 0:3, sample size 4:6, divisor
+            // 8:10, multiplier 11:13, base-rate select 14). Dropping this
+            // write left fmt=0 forever, which the worker decoded as 8-bit
+            // mono 48 kHz — pacing was correct only by accident when the
+            // codec was locked to 16-bit mono 48 kHz (the bytes_per_frame
+            // miscalculation cancelled out). With wider rate advertisement
+            // any non-48 kHz / non-16-bit stream paces wrong, producing
+            // host PCM underrun cycles audible as buzz / dropout / silence.
+            hda->stream_output.fmt = read_uint16_le(data);
             break;
         case SOUND_HDA_OSD0BDPL:
             hda->stream_output.bdl_lo = read_uint32_le(data);
