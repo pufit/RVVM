@@ -496,6 +496,66 @@ static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset,
             write_uint16_le(data, SOUND_HDA_FIFO_SIZE);
             break;
 
+        // Stream descriptor registers that MUST be readable so the guest's
+        // read-modify-write sequences round-trip correctly. Linux's HDA
+        // driver uses snd_hdac_stream_updateb(SD_CTL, mask, val) at stream
+        // stop, which does:
+        //
+        //   old = read(SD_CTL);
+        //   new = (old & ~mask) | val;
+        //   if (old != new) write(SD_CTL, new);
+        //
+        // If our read returns garbage (stack-local `uint64_t tmp` in
+        // riscv_load_u32 isn't zero-initialised — it carries whatever the
+        // previous JIT slot left behind), and the garbage happens to
+        // already satisfy the mask (e.g. bits 1-4 already clear), then
+        // `old == new` and Linux SKIPS the write. The stream stays
+        // running=1 in our emulator while Linux's ALSA close path
+        // proceeds under the assumption that STOP trigger fired. The
+        // worker keeps walking the BDL after the guest has freed the
+        // DMA region — reading garbage PCM, stalling teardown, and
+        // under the Ctrl+C scenario producing a hard-to-diagnose VM
+        // unresponsiveness because the guest's aplay release holds
+        // substream->lock while our worker repeatedly contends for
+        // bus->reg_lock inside (now-actually-delivered, post-IRQ-fix)
+        // period IRQs that should have been disabled by a successful
+        // stop sequence.
+        //
+        // The fix is one-for-one: every SDnCTL/SDnCBL/SDnLVI/SDnFMT/
+        // SDnBDPL/SDnBDPU field that the write path stores needs a
+        // matching read path that returns the stored value. Otherwise
+        // any guest driver that does RMW on these regs is at the mercy
+        // of uninitialised-stack contents.
+        case SOUND_HDA_OSD0CTL: {
+            // 24-bit register (3 bytes at SD_CTL..SD_CTL+2). Linux reads
+            // 1 byte for SD_CTL (RUN/IOCE/FEIE/DEIE/TP bits).
+            uint8_t ctl = 0;
+            ctl |= (atomic_load_uint32_relax(&hda->stream_output.running) ? 1u : 0u) << 1;
+            ctl |= (hda->stream_output.ioce & 1u) << 2;
+            // Bits 23:20 carry the guest-assigned stream number — used
+            // by the codec to route stream tags. We persist the full
+            // stream tag in stream->stream (see VERB_SET_CONV_STREAM_CHAN
+            // at line ~691) but don't store the SDnCTL view; low 8 bits
+            // are enough for Linux's updateb.
+            write_uint8(data, ctl);
+            break;
+        }
+        case SOUND_HDA_OSD0CBL:
+            write_uint32_le(data, hda->stream_output.bdl_len);
+            break;
+        case SOUND_HDA_OSD0LVI:
+            write_uint16_le(data, hda->stream_output.bdl_lvi);
+            break;
+        case SOUND_HDA_OSD0FMT:
+            write_uint16_le(data, hda->stream_output.fmt);
+            break;
+        case SOUND_HDA_OSD0BDPL:
+            write_uint32_le(data, hda->stream_output.bdl_lo);
+            break;
+        case SOUND_HDA_OSD0BDPU:
+            write_uint32_le(data, hda->stream_output.bdl_hi);
+            break;
+
         default:
             spin_unlock(&hda->lock);
             return false;
