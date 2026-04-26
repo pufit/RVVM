@@ -261,6 +261,61 @@ PUSH_OPTIMIZATION_SIZE
 
 #define CODEC_PARAM_SUPP_PCM_SIZE_RATES                  0x0A
 
+// HDA stream rates. Single source of truth for both the
+// CODEC_PARAM_SUPP_PCM_SIZE_RATES advertisement bitmask (parameter
+// 0x0A, bits 0..10) and the stream format register encoding (HDA
+// spec 7.3.3.10: base / multiplier / divisor in SDnFMT bits 14, 13:11,
+// 10:8). Mirrors the autodetected portion of Linux's rate_bits[] in
+// sound/hda/hdac_device.c. 384 kHz (bit 11) is reserved on real HW
+// and intentionally omitted.
+//
+// X(hz, bit_pos, base_khz, mult, div):
+//   hz       — sample rate in Hz
+//   bit_pos  — bit position in SUPP_PCM_SIZE_RATES
+//   base_khz — 44 or 48 (selects base-rate bit 14 in SDnFMT)
+//   mult     — rate multiplier (1..4), encoded as (N-1) in bits 13:11
+//   div      — rate divisor    (1..8), encoded as (N-1) in bits 10:8
+#define HDA_RATE_TABLE(X)         \
+    X(  8000,  0, 48, 1, 6)       \
+    X( 11025,  1, 44, 1, 4)       \
+    X( 16000,  2, 48, 1, 3)       \
+    X( 22050,  3, 44, 1, 2)       \
+    X( 32000,  4, 48, 2, 3)       \
+    X( 44100,  5, 44, 1, 1)       \
+    X( 48000,  6, 48, 1, 1)       \
+    X( 88200,  7, 44, 2, 1)       \
+    X( 96000,  8, 48, 2, 1)       \
+    X(176400,  9, 44, 4, 1)       \
+    X(192000, 10, 48, 4, 1)
+
+enum {
+#define HDA_RATE_BIT_ENUM(hz, bit, base, mult, div) HDA_RATE_BIT_POS_##hz = bit,
+    HDA_RATE_TABLE(HDA_RATE_BIT_ENUM)
+#undef HDA_RATE_BIT_ENUM
+};
+
+enum {
+#define HDA_FMT_ENUM(hz, bit, base, mult, div) \
+    HDA_FMT_RATE_##hz = (((base) == 44 ? 1u : 0u) << 14) \
+                      | (((mult) - 1) << 11) \
+                      | (((div)  - 1) <<  8),
+    HDA_RATE_TABLE(HDA_FMT_ENUM)
+#undef HDA_FMT_ENUM
+};
+
+// Bit in CODEC_PARAM_SUPP_PCM_SIZE_RATES advertising a given Hz rate.
+// Compile-time constant; pass a literal Hz value present in
+// HDA_RATE_TABLE (otherwise expands to an undeclared identifier).
+#define HDA_RATE_BIT(hz)         (1u << HDA_RATE_BIT_POS_##hz)
+
+// Sample-size advertisement bits in SUPP_PCM_SIZE_RATES (HDA spec
+// 7.3.4.1, parameter 0x0A bits 16..20).
+#define HDA_PCM_SIZE_8           (1u << 16)
+#define HDA_PCM_SIZE_16          (1u << 17)
+#define HDA_PCM_SIZE_20          (1u << 18)
+#define HDA_PCM_SIZE_24          (1u << 19)
+#define HDA_PCM_SIZE_32          (1u << 20)
+
 #define CODEC_PARAM_SUPP_STREAM_FMTS                     0x0B
 #define CODEC_PARAM_SUPP_STREAM_FMTS_PCM                 (1 << 0)
 #define CODEC_PARAM_SUPP_STREAM_FMTS_FLOAT32             (1 << 1)
@@ -614,20 +669,30 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
 
         case CODEC_PARAM_SUPP_PCM_SIZE_RATES:
-            // Advertise ONLY 48 kHz, 16-bit. If we advertised the full
-            // 8-192 kHz / 8-32 bit range, the Linux driver would let the
-            // application pick its file's native rate, but the stream
-            // worker has no per-stream rate awareness — it paces to a
-            // fixed bytes/sec. So playing a 48 kHz WAV against a codec
-            // that accepts 192 kHz caused 4× slow playback + aliasing.
+            // Earlier this was locked to 48 kHz only because the worker
+            // had no per-stream rate awareness and paced to a fixed
+            // bytes/sec — 4× slow playback at 192 kHz, etc. The pacing
+            // now derives from stream->fmt (see sound_hda_stream_drain
+            // at the SAMPLE_RATE_BYTES_PER_SEC computation), so the
+            // worker adapts to whatever the guest actually selects.
             //
-            // Fixing the codec to one format makes ALSA + the HDA driver
-            // handle any rate mismatch in software (linear-interp upsample
-            // or straight passthrough), with the emulator's rate
-            // always matching the pacing math. 48 kHz mono 16-bit is
-            // what every common audio file decodes to after ffmpeg/afconvert,
-            // so the hot path is pure passthrough.
-            return (1 << 17) | (1 << 6); // 16-bit, 48 kHz
+            // Locking the codec was overly strict for the common ALSA
+            // configuration: HDA-Intel's `default` PCM resolves to raw
+            // hw access (no `plug` plugin), so the application's
+            // hw_params must match what the codec advertises. With
+            // 48 kHz only, anything else (mpg123 at 44.1, speaker-test
+            // at any non-48k) silently fails to open and produces no
+            // sound — only apps that happen to write 48 kHz mono
+            // (aplay of a 48 kHz WAV) work.
+            //
+            // Advertise 44.1 / 48 / 88.2 / 96 kHz @ 16-bit. Covers
+            // MP3 (44.1), WAV/system sounds (48), and hi-res (88.2/96)
+            // without offering rates the worker would have to fake.
+            // Worker downmixes any inadvertent stereo and pacing
+            // adapts via stream->fmt; nothing else needs to know.
+            return HDA_PCM_SIZE_16
+                 | HDA_RATE_BIT(44100) | HDA_RATE_BIT(48000)
+                 | HDA_RATE_BIT(88200) | HDA_RATE_BIT(96000);
 
         case CODEC_PARAM_SUPP_STREAM_FMTS:
             return CODEC_PARAM_SUPP_STREAM_FMTS_PCM;
@@ -666,7 +731,11 @@ static uint32_t sound_hda_codec_output_cmd(uint32_t payload)
                  | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OUT;
 
         case CODEC_PARAM_SUPP_PCM_SIZE_RATES:
-            return (1 << 17) | (1 << 6); // 16-bit, 48 kHz (see root-node comment)
+            // Match the converter widget's advertised rates (see
+            // CODEC_PARAM_SUPP_PCM_SIZE_RATES at the root node).
+            return HDA_PCM_SIZE_16
+                 | HDA_RATE_BIT(44100) | HDA_RATE_BIT(48000)
+                 | HDA_RATE_BIT(88200) | HDA_RATE_BIT(96000);
 
         case CODEC_PARAM_SUPP_STREAM_FMTS:
             return CODEC_PARAM_SUPP_STREAM_FMTS_PCM;
