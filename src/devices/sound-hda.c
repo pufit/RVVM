@@ -31,7 +31,7 @@ PUSH_OPTIMIZATION_SIZE
 #define SOUND_HDA_GLOBAL_CTRL         0x08 // Global Control
 #define SOUND_HDA_WAKEEN              0x0C // Wake enable
 #define SOUND_HDA_STATESTS            0x0E // State Change Status
-#define SOUND_HDA_GTS                 0x10 // Global status
+#define SOUND_HDA_GSTS                0x10 // Global status
 #define SOUND_HDA_OUTSTRMPAY          0x18 // Output stream payload capability
 #define SOUND_HDA_INSTRMPAY           0x1A // Input stream payload capability
 #define SOUND_HDA_INTR_CTRL           0x20 // Interrupt Control
@@ -52,8 +52,12 @@ PUSH_OPTIMIZATION_SIZE
 #define SOUND_HDA_RIRB_CTRL           0x5C // RIRB Control
 #define SOUND_HDA_RIRB_STATUS         0x5D // RIRB Status
 #define SOUND_HDA_RIRB_SIZE           0x5E // RIRB Size
+#define SOUND_HDA_ICW                 0x60 // Immediate Command Output (§3.4.1)
+#define SOUND_HDA_IRR                 0x64 // Immediate Response Input  (§3.4.2)
+#define SOUND_HDA_ICS                 0x68 // Immediate Command Status  (§3.4.3)
 #define SOUND_HDA_DMA_LO              0x70 // DMA Position Lower Base Address
 #define SOUND_HDA_DMA_HI              0x74 // DMA Position Upper Base Address
+#define SOUND_HDA_WALCLKA             0x2030 // Wall Clock Counter Alias (§3.3.44)
 
 // Stream descriptor blocks (HDA spec §3.3.34, page 27): identical 0x20-byte
 // register layout for every input, output, and bidirectional descriptor.
@@ -540,12 +544,18 @@ struct sound_hda_dev_s {
     pci_func_t* pci_func;
     spinlock_t  lock;
     uint32_t    gctl;
+    uint16_t    wakeen;        // §3.3.8  — preserved across CRST
+    uint16_t    statests;      // §3.3.9  — codec presence; bit 0 = our codec
+    uint16_t    gsts;          // §3.3.10 — flush status (we don't model flush)
+    uint32_t    ssync;         // §3.3.17 — stream sync, round-trip only
     uint32_t    intr_ctrl;
     uint32_t    corb_lo;
     uint32_t    corb_hi;
     uint16_t    corb_rp;
     uint16_t    corb_wp;
     uint32_t    corb_size;
+    uint8_t     corbctl;       // §3.3.22 — CORBRUN/CMEIE; round-trip only
+    uint8_t     corbsts;       // §3.3.23 — CORB error status; never set by us
     uint32_t    rirb_lo;
     uint32_t    rirb_hi;
     uint32_t    rirb_rp;
@@ -553,6 +563,12 @@ struct sound_hda_dev_s {
     uint32_t    rirb_size;
     uint32_t    rirb_cnt;
     uint32_t    rirb_status;
+    uint8_t     rirbctl;       // §3.3.29 — RIRBDMAEN/RINTCTL; round-trip only
+    uint32_t    dplbase;       // §3.3.32 — DMA Position Buffer base low
+    uint32_t    dpubase;       // §3.3.33 — DMA Position Buffer base high
+    uint32_t    icw;           // §3.4.1  — Immediate Command Output
+    uint32_t    irr;           // §3.4.2  — Immediate Response Input
+    uint16_t    ics;           // §3.4.3  — Immediate Command Status
     uint32_t    power_state;
 
     sound_hda_stream_t streams[HDA_STREAMS_TOTAL];
@@ -610,27 +626,29 @@ typedef struct {
     const char     *name;        // diagnostics; matches the spec mnemonic
 } sd_reg_t;
 
-// Read/write a stream-struct field by (offset, size) — treats it as a
-// little-endian unsigned integer of the requested width. Used by the
-// storage-kind dispatch entries.
-static uint32_t sd_field_load(sound_hda_stream_t *s, uint16_t off, uint8_t sz)
+// Read/write a struct field at (offset, size) as a little-endian
+// unsigned integer of the requested width. Used by both the SD register
+// table (base = sound_hda_stream_t*) and the global controller register
+// table (base = sound_hda_dev_t*) — same shape of operation, different
+// host struct, so the helper is generic over the base pointer.
+static uint32_t reg_field_load(void *base, uint16_t off, uint8_t sz)
 {
-    uint8_t *base = (uint8_t*)s + off;
+    uint8_t *p = (uint8_t*)base + off;
     switch (sz) {
-        case 1:  return *(uint8_t  *)base;
-        case 2:  return *(uint16_t *)base;
-        case 4:  return *(uint32_t *)base;
+        case 1:  return *(uint8_t  *)p;
+        case 2:  return *(uint16_t *)p;
+        case 4:  return *(uint32_t *)p;
         default: return 0;
     }
 }
 
-static void sd_field_store(sound_hda_stream_t *s, uint16_t off, uint8_t sz, uint32_t v)
+static void reg_field_store(void *base, uint16_t off, uint8_t sz, uint32_t v)
 {
-    uint8_t *base = (uint8_t*)s + off;
+    uint8_t *p = (uint8_t*)base + off;
     switch (sz) {
-        case 1: *(uint8_t  *)base = (uint8_t)v;  break;
-        case 2: *(uint16_t *)base = (uint16_t)v; break;
-        case 4: *(uint32_t *)base = v;           break;
+        case 1: *(uint8_t  *)p = (uint8_t)v;  break;
+        case 2: *(uint16_t *)p = (uint16_t)v; break;
+        case 4: *(uint32_t *)p = v;           break;
     }
 }
 
@@ -728,7 +746,7 @@ static bool sd_dispatch_read(sound_hda_dev_t *hda, sound_hda_stream_t *s,
     switch (r->kind) {
         case SD_REG_RW_FIELD:
         case SD_REG_RO_FIELD:
-            v = sd_field_load(s, r->field_off, r->field_size);
+            v = reg_field_load(s, r->field_off, r->field_size);
             break;
         case SD_REG_RO_FN:
         case SD_REG_ACTION:
@@ -747,7 +765,7 @@ static bool sd_dispatch_write(sound_hda_dev_t *hda, sound_hda_stream_t *s,
     uint32_t v = mmio_load(data, size);
     switch (r->kind) {
         case SD_REG_RW_FIELD:
-            sd_field_store(s, r->field_off, r->field_size, v);
+            reg_field_store(s, r->field_off, r->field_size, v);
             break;
         case SD_REG_RO_FIELD:
         case SD_REG_RO_FN:
@@ -755,6 +773,288 @@ static bool sd_dispatch_write(sound_hda_dev_t *hda, sound_hda_stream_t *s,
             break;
         case SD_REG_ACTION:
             r->write_fn(hda, s, v);
+            break;
+    }
+    return true;
+}
+
+// === Global controller register dispatch ===
+//
+// Same pattern as sd_regs[] above, applied to the controller's global
+// register block at offsets 0x00-0x7F (HDA spec §3.3.1-§3.3.31) plus
+// the §3.4 immediate command interface and the §3.3.44 wall-clock
+// alias. Adding a missing register is a one-row change; the dispatch
+// has no per-register knowledge.
+typedef enum {
+    GR_REG_RW_FIELD = 0,
+    GR_REG_RO_FIELD,
+    GR_REG_RO_FN,
+    GR_REG_RO_CONST,
+    GR_REG_ACTION,
+} gr_reg_kind_t;
+
+typedef uint32_t (*gr_reg_read_fn) (sound_hda_dev_t*);
+typedef void     (*gr_reg_write_fn)(sound_hda_dev_t*, uint32_t);
+
+typedef struct {
+    uint16_t        off;
+    uint8_t         width;
+    gr_reg_kind_t   kind;
+    uint16_t        field_off;     // offsetof(sound_hda_dev_t, field)
+    uint8_t         field_size;
+    uint32_t        const_val;     // RO_CONST
+    gr_reg_read_fn  read_fn;       // RO_FN / ACTION
+    gr_reg_write_fn write_fn;      // ACTION
+    const char     *name;
+} gr_reg_t;
+
+// Forward decls — bodies live below to keep table-construction tight.
+static uint32_t sound_hda_compute_intsts(sound_hda_dev_t *hda);
+static uint32_t sound_hda_wallclk(void);
+static void     sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v);
+static void     sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd);
+static void     sound_hda_controller_reset(sound_hda_dev_t *hda);
+
+// === Global register callbacks ===
+static uint32_t gr_gctl_read(sound_hda_dev_t *hda)
+{
+    // GCTL bit 8 UNSOL is force-on: we accept unsolicited responses
+    // unconditionally (no source generates them today, but the bit
+    // advertises the capability). Bit 0 CRST round-trips honestly.
+    return hda->gctl | (1u << 8);
+}
+
+static void gr_gctl_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // CRST 1→0: enter reset (halt streams + zero ring/state).
+    // CRST 0→1: exit reset; re-set STATESTS bit 0 because the codec
+    //           re-asserts presence on link out-of-reset (§3.3.9).
+    uint32_t prev = hda->gctl;
+    hda->gctl = v;
+    if ((prev & 1u) && !(v & 1u)) {
+        sound_hda_controller_reset(hda);
+    } else if (!(prev & 1u) && (v & 1u)) {
+        hda->statests |= 0x0001u;   // codec on SDIN[0]
+    }
+}
+
+static uint32_t gr_intsts_read(sound_hda_dev_t *hda)  { return sound_hda_compute_intsts(hda); }
+static uint32_t gr_wallclk_read(sound_hda_dev_t *hda) { (void)hda; return sound_hda_wallclk(); }
+
+static void gr_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    sound_hda_corb_wp_write(hda, v);
+}
+
+static void gr_corb_rp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.21: bit 15 self-clears RP.
+    hda->corb_rp = (v & 0x8000u) ? 0u : (v & 0x7Fu);
+}
+
+static const uint32_t hda_corb_sizes[4] = { 8,  64, 1024, 0 };
+static const uint32_t hda_rirb_sizes[4] = { 16, 128, 2048, 0 };
+
+static uint32_t gr_corb_size_read(sound_hda_dev_t *hda)
+{
+    (void)hda;
+    return (SOUND_HDA_PARAM_CORBSZCAP << 4) | SOUND_HDA_PARAM_CORBSIZE;
+}
+
+static void gr_corb_size_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    uint32_t sz = hda_corb_sizes[v & 0x3u];
+    if (sz) hda->corb_size = sz;
+}
+
+static uint32_t gr_rirb_size_read(sound_hda_dev_t *hda)
+{
+    (void)hda;
+    return (SOUND_HDA_PARAM_RIRBSZCAP << 4) | SOUND_HDA_PARAM_RIRBSIZE;
+}
+
+static void gr_rirb_size_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    uint32_t sz = hda_rirb_sizes[v & 0x3u];
+    if (sz) hda->rirb_size = sz;
+}
+
+static void gr_rirb_wp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    hda->rirb_wp = (v & 0x8000u) ? 0u : (v & 0xFFu);
+}
+
+static void gr_rirb_status_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    hda->rirb_status &= ~(v & 0x3u);   // RW1C against bits 0/1
+}
+
+static void gr_statests_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.9: RW1CS — writing 1 clears the corresponding bit. Bits are
+    // sticky (only cleared by power-on reset or RW1C), preserved across
+    // CRST. Clear masked bits in stored value.
+    hda->statests &= ~(v & 0x7FFFu);
+}
+
+static void gr_gsts_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.10: only bit 1 FSTS is RW1C. We don't model flush.
+    hda->gsts &= ~(v & 0x2u);
+}
+
+static void gr_corbsts_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.23: bit 0 CMEI is RW1C. We never raise CORB memory errors.
+    hda->corbsts &= ~(v & 0x1u);
+}
+
+// §3.4 Immediate Command Interface — PIO-style alternative to CORB/RIRB.
+// Writing ICS bit 0 (ICB=1) dispatches the value in ICW as a codec verb,
+// latches the response in IRR, sets ICS bit 1 (IRV), clears ICB.
+static void gr_ics_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    if (v & 0x1u) {
+        // ICB=1 → dispatch the queued verb. Mirror the CORB path: the
+        // codec_cmd function writes to RIRB and raises the IRQ; we
+        // additionally latch the response in IRR for the PIO path.
+        // codec_cmd's RIRB write side-effect is harmless if guest is
+        // using PIO exclusively (RIRB ring may be unallocated; the
+        // pci_get_dma_ptr inside sound_hda_write_rirb returns NULL and
+        // the function exits cleanly).
+        //
+        // Use a tiny shim: capture the response by intercepting the
+        // RIRB write, OR just dispatch through the same verb-decoder
+        // path. Simplest: inline a minimal version.
+        sound_hda_codec_cmd(hda, hda->icw);
+        // Response was written into RIRB at hda->rirb_wp. Read it back
+        // for IRR. (rirb_lo+rirb_wp*8 holds the response dword.)
+        if (hda->rirb_lo) {
+            uint32_t *resp = pci_get_dma_ptr(hda->pci_func,
+                (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8, 4);
+            if (resp) hda->irr = *resp;
+        }
+        hda->ics = (hda->ics & ~0x1u) | 0x2u;   // clear ICB, set IRV
+    }
+    if (v & 0x2u) {
+        hda->ics &= ~0x2u;                       // RW1C clears IRV
+    }
+}
+
+#define GR_FIELD_OFF(field)   offsetof(sound_hda_dev_t, field)
+#define GR_FIELD_SIZE(field)  sizeof(((sound_hda_dev_t*)0)->field)
+#define GR_RW(off, w, field) \
+    { (off), (w), GR_REG_RW_FIELD, GR_FIELD_OFF(field), GR_FIELD_SIZE(field), 0, NULL, NULL, #field }
+#define GR_RO(off, w, field) \
+    { (off), (w), GR_REG_RO_FIELD, GR_FIELD_OFF(field), GR_FIELD_SIZE(field), 0, NULL, NULL, #field }
+#define GR_RO_CONST(off, w, val, name_str) \
+    { (off), (w), GR_REG_RO_CONST, 0, 0, (val), NULL, NULL, name_str }
+#define GR_ACTION(off, w, fname, rfn, wfn, name_str) \
+    { (off), (w), GR_REG_ACTION, GR_FIELD_OFF(fname), GR_FIELD_SIZE(fname), 0, (rfn), (wfn), name_str }
+#define GR_RO_FN(off, w, rfn, name_str) \
+    { (off), (w), GR_REG_RO_FN, 0, 0, 0, (rfn), NULL, name_str }
+
+// Global controller register table.
+static const gr_reg_t gr_regs[] = {
+    GR_RO_CONST(SOUND_HDA_GCAP,         2, SOUND_HDA_PARAM_GCAP,                     "GCAP"      ),
+    GR_RO_CONST(SOUND_HDA_VS,           2, SOUND_HDA_PARAM_V,                        "VS"        ),
+    GR_RO_CONST(SOUND_HDA_OUTPAY,       2, 0x3C,                                     "OUTPAY"    ),
+    GR_RO_CONST(SOUND_HDA_INPAY,        2, 0x1D,                                     "INPAY"     ),
+    GR_ACTION(SOUND_HDA_GLOBAL_CTRL,    4, gctl,     gr_gctl_read,    gr_gctl_write, "GCTL"      ),
+    GR_RW(SOUND_HDA_WAKEEN,             2, wakeen),
+    GR_ACTION(SOUND_HDA_STATESTS,       2, statests, NULL, gr_statests_write,        "STATESTS"  ),
+    GR_ACTION(SOUND_HDA_GSTS,           2, gsts,     NULL, gr_gsts_write,            "GSTS"      ),
+    // OUTSTRMPAY/INSTRMPAY: 0x00 = "no limit beyond OUT/INPAY". Spec
+    // §3.3.11/12 — most controllers report 0 here.
+    GR_RO_CONST(SOUND_HDA_OUTSTRMPAY,   2, 0x0000,                                   "OUTSTRMPAY"),
+    GR_RO_CONST(SOUND_HDA_INSTRMPAY,    2, 0x0000,                                   "INSTRMPAY" ),
+    GR_RW(SOUND_HDA_INTR_CTRL,          4, intr_ctrl),
+    GR_RO_FN(SOUND_HDA_INTSTS,          4, gr_intsts_read,                           "INTSTS"    ),
+    GR_RO_FN(SOUND_HDA_WALL_CLOCK,      4, gr_wallclk_read,                          "WALLCLK"   ),
+    GR_RW(SOUND_HDA_STREAM_SYNC,        4, ssync),
+    GR_RW(SOUND_HDA_CORB_LO,            4, corb_lo),
+    GR_RW(SOUND_HDA_CORB_HI,            4, corb_hi),
+    GR_ACTION(SOUND_HDA_CORB_WP,        2, corb_wp,  NULL, gr_corb_wp_write,         "CORBWP"    ),
+    GR_ACTION(SOUND_HDA_CORB_RP,        2, corb_rp,  NULL, gr_corb_rp_write,         "CORBRP"    ),
+    GR_RW(SOUND_HDA_CORB_CTRL,          1, corbctl),
+    GR_ACTION(SOUND_HDA_CORB_STATUS,    1, corbsts,  NULL, gr_corbsts_write,         "CORBSTS"   ),
+    GR_ACTION(SOUND_HDA_CORB_SIZE,      1, corb_size, gr_corb_size_read, gr_corb_size_write, "CORBSIZE"),
+    GR_RW(SOUND_HDA_RIRB_LO,            4, rirb_lo),
+    GR_RW(SOUND_HDA_RIRB_HI,            4, rirb_hi),
+    GR_ACTION(SOUND_HDA_RIRB_WP,        2, rirb_wp,  NULL, gr_rirb_wp_write,         "RIRBWP"    ),
+    GR_RW(SOUND_HDA_RIRB_INTR_CNT,      2, rirb_cnt),
+    GR_RW(SOUND_HDA_RIRB_CTRL,          1, rirbctl),
+    GR_ACTION(SOUND_HDA_RIRB_STATUS,    1, rirb_status, NULL, gr_rirb_status_write,  "RIRBSTS"   ),
+    GR_ACTION(SOUND_HDA_RIRB_SIZE,      1, rirb_size, gr_rirb_size_read, gr_rirb_size_write, "RIRBSIZE"),
+    GR_RW(SOUND_HDA_ICW,                4, icw),
+    GR_RW(SOUND_HDA_IRR,                4, irr),
+    GR_ACTION(SOUND_HDA_ICS,            2, ics,      NULL, gr_ics_write,             "ICS"       ),
+    GR_RW(SOUND_HDA_DMA_LO,             4, dplbase),
+    GR_RW(SOUND_HDA_DMA_HI,             4, dpubase),
+    GR_RO_FN(SOUND_HDA_WALCLKA,         4, gr_wallclk_read,                          "WALCLKA"   ),
+};
+
+#undef GR_RW
+#undef GR_RO
+#undef GR_RO_CONST
+#undef GR_ACTION
+#undef GR_RO_FN
+#undef GR_FIELD_OFF
+#undef GR_FIELD_SIZE
+
+static const gr_reg_t *gr_reg_lookup(uint16_t off)
+{
+    for (size_t i = 0; i < sizeof(gr_regs) / sizeof(gr_regs[0]); ++i) {
+        if (gr_regs[i].off == off) return &gr_regs[i];
+    }
+    return NULL;
+}
+
+static bool gr_dispatch_read(sound_hda_dev_t *hda, size_t offset,
+                             void *data, uint8_t size)
+{
+    const gr_reg_t *r = gr_reg_lookup((uint16_t)offset);
+    if (r == NULL) return false;
+    uint32_t v = 0;
+    switch (r->kind) {
+        case GR_REG_RW_FIELD:
+        case GR_REG_RO_FIELD:
+            v = reg_field_load(hda, r->field_off, r->field_size);
+            break;
+        case GR_REG_RO_CONST:
+            v = r->const_val;
+            break;
+        case GR_REG_RO_FN:
+            v = r->read_fn(hda);
+            break;
+        case GR_REG_ACTION:
+            // ACTION may have a custom read (e.g. GCTL composes UNSOL
+            // bit) or default to backing-field read.
+            v = r->read_fn ? r->read_fn(hda)
+                           : reg_field_load(hda, r->field_off, r->field_size);
+            break;
+    }
+    mmio_store(data, size, v);
+    return true;
+}
+
+static bool gr_dispatch_write(sound_hda_dev_t *hda, size_t offset,
+                              const void *data, uint8_t size)
+{
+    const gr_reg_t *r = gr_reg_lookup((uint16_t)offset);
+    if (r == NULL) return false;
+    uint32_t v = mmio_load(data, size);
+    switch (r->kind) {
+        case GR_REG_RW_FIELD:
+            reg_field_store(hda, r->field_off, r->field_size, v);
+            break;
+        case GR_REG_RO_FIELD:
+        case GR_REG_RO_FN:
+        case GR_REG_RO_CONST:
+            // Read-only — writes ignored.
+            break;
+        case GR_REG_ACTION:
+            r->write_fn(hda, v);
             break;
     }
     return true;
@@ -872,53 +1172,17 @@ static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset,
 {
     sound_hda_dev_t *hda = dev->data;
     spin_lock(&hda->lock);
-    bool ok = true;
-    uint32_t v = 0;
 
-    switch (offset) {
-        case SOUND_HDA_GCAP:        v = SOUND_HDA_PARAM_GCAP; break;
-        case SOUND_HDA_VS:          v = SOUND_HDA_PARAM_V;    break;
-        case SOUND_HDA_OUTPAY:      v = 0x3C;                 break;
-        case SOUND_HDA_INPAY:       v = 0x1D;                 break;
-        case SOUND_HDA_GLOBAL_CTRL:
-            // GCTL (HDA spec §3.3.7). Bit 0 CRST is RWS — readback
-            // reflects what was last written so guest reset polls see
-            // both CRST=0 (in-reset) and CRST=1 (out-of-reset)
-            // transitions. Bit 8 UNSOL is force-on: we accept
-            // unsolicited responses unconditionally (the codec doesn't
-            // currently emit any, so this is purely advertised
-            // capability). Other bits round-trip from the stored value.
-            v = hda->gctl | (1u << 8);
-            break;
-        case SOUND_HDA_INTR_CTRL:   v = hda->intr_ctrl;             break;
-        case SOUND_HDA_INTSTS:      v = sound_hda_compute_intsts(hda); break;
-        case SOUND_HDA_WALL_CLOCK:  v = sound_hda_wallclk();        break;
-        case SOUND_HDA_CORB_WP:     v = hda->corb_wp;               break;
-        case SOUND_HDA_CORB_RP:     v = hda->corb_rp & 0xFFu;       break;
-        case SOUND_HDA_CORB_SIZE:
-            v = (SOUND_HDA_PARAM_CORBSZCAP << 4) | SOUND_HDA_PARAM_CORBSIZE;
-            break;
-        case SOUND_HDA_RIRB_WP:     v = hda->rirb_wp & 0xFFu;       break;
-        case SOUND_HDA_RIRB_STATUS: v = hda->rirb_status & 0xFFu;   break;
-        case SOUND_HDA_RIRB_SIZE:
-            v = (SOUND_HDA_PARAM_RIRBSZCAP << 4) | SOUND_HDA_PARAM_RIRBSIZE;
-            break;
-        default: {
-            // Stream descriptor block — dispatch through the SD register
-            // table. Same dispatch services every input, output, and
-            // bidirectional descriptor (HDA spec §3.3.34: shared layout).
-            uint16_t sub_off;
-            sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
-            if (s != NULL && sd_dispatch_read(hda, s, sub_off, data, size)) {
-                spin_unlock(&hda->lock);
-                return true;
-            }
-            ok = false;
-            break;
-        }
+    // Try the global controller register table first; on miss, try the
+    // stream descriptor block (HDA spec §3.3.34: shared 0x20-byte layout
+    // for input/output/bidir streams).
+    bool ok = gr_dispatch_read(hda, offset, data, size);
+    if (!ok) {
+        uint16_t sub_off;
+        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
+        if (s != NULL) ok = sd_dispatch_read(hda, s, sub_off, data, size);
     }
 
-    if (ok) mmio_store(data, size, v);
     spin_unlock(&hda->lock);
     return ok;
 }
@@ -1691,9 +1955,10 @@ static void sound_hda_controller_reset(sound_hda_dev_t *hda)
     // zeroed: any new dma fetch will fail and the worker exits.
 }
 
-// CORB write-pointer write (HDA spec §3.3.20). The full DMA model would
-// have a CORB engine consume entries from RP+1..WP at its own pace; we
-// instead synchronously fetch the entry at WP and dispatch it inline.
+// CORB write-pointer action (HDA spec §3.3.20). Used by the global
+// register table's CORBWP entry. Full DMA model would have a CORB
+// engine consume entries from RP+1..WP at its own pace; we instead
+// synchronously fetch the entry at WP and dispatch it inline.
 // Functionally OK for Linux which bumps WP after every entry, but a
 // guest that batches multiple commands before bumping WP loses all but
 // the last — a known limitation.
@@ -1705,68 +1970,16 @@ static void sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
     if (cmd) sound_hda_codec_cmd(hda, *cmd);
 }
 
-// CORBSIZE / RIRBSIZE write — encoding (bits 1:0) selects ring depth.
-static const uint32_t hda_corb_sizes[4] = { 8,  64, 1024, 0 };
-static const uint32_t hda_rirb_sizes[4] = { 16, 128, 2048, 0 };
-
 static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
     sound_hda_dev_t *hda = dev->data;
     spin_lock(&hda->lock);
-    bool ok = true;
-    uint32_t v = mmio_load(data, size);
 
-    switch (offset) {
-        case SOUND_HDA_GLOBAL_CTRL: {
-            // CRST 1→0: enter reset. Halt streams + zero ring/state.
-            // CRST 0→1: leave reset (no extra action; readback now
-            // returns 1 once the new gctl is stored).
-            uint32_t prev = hda->gctl;
-            hda->gctl = v;
-            if ((prev & 1u) && !(v & 1u)) {
-                sound_hda_controller_reset(hda);
-            }
-            break;
-        }
-        case SOUND_HDA_INTR_CTRL:   hda->intr_ctrl = v; break;
-        case SOUND_HDA_CORB_LO:     hda->corb_lo   = v; break;
-        case SOUND_HDA_CORB_HI:     hda->corb_hi   = v; break;
-        case SOUND_HDA_CORB_WP:     sound_hda_corb_wp_write(hda, v); break;
-        case SOUND_HDA_CORB_RP:
-            // Bit 15 self-clears RP per §3.3.21.
-            hda->corb_rp = (v & 0x8000u) ? 0u : (v & 0x7Fu);
-            break;
-        case SOUND_HDA_CORB_SIZE: {
-            uint32_t sz = hda_corb_sizes[v & 0x3u];
-            if (sz) hda->corb_size = sz;
-            break;
-        }
-        case SOUND_HDA_RIRB_LO:     hda->rirb_lo   = v; break;
-        case SOUND_HDA_RIRB_HI:     hda->rirb_hi   = v; break;
-        case SOUND_HDA_RIRB_WP:
-            hda->rirb_wp = (v & 0x8000u) ? 0u : (v & 0xFFu);
-            break;
-        case SOUND_HDA_RIRB_INTR_CNT: hda->rirb_cnt = v; break;
-        case SOUND_HDA_RIRB_STATUS:
-            // RW1C against bits 0/1.
-            hda->rirb_status &= ~(v & 0x3u);
-            break;
-        case SOUND_HDA_RIRB_SIZE: {
-            uint32_t sz = hda_rirb_sizes[v & 0x3u];
-            if (sz) hda->rirb_size = sz;
-            break;
-        }
-        default: {
-            // Stream descriptor block — same dispatch as the read path.
-            uint16_t sub_off;
-            sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
-            if (s != NULL && sd_dispatch_write(hda, s, sub_off, data, size)) {
-                spin_unlock(&hda->lock);
-                return true;
-            }
-            ok = false;
-            break;
-        }
+    bool ok = gr_dispatch_write(hda, offset, data, size);
+    if (!ok) {
+        uint16_t sub_off;
+        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
+        if (s != NULL) ok = sd_dispatch_write(hda, s, sub_off, data, size);
     }
 
     spin_unlock(&hda->lock);
@@ -1808,6 +2021,11 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
                                     void *user_data)
 {
     sound_hda_dev_t *sound_hda = safe_new_obj(sound_hda_dev_t);
+
+    // §3.3.9 STATESTS: bit 0 = 1 announces a codec on SDIN[0]. Sticky
+    // until power-on reset, preserved across CRST. Linux's HDA driver
+    // reads STATESTS during probe to enumerate codecs.
+    sound_hda->statests = 0x0001;
 
     // Initialize per-stream identity. Descriptor index = SIE/SIS bit per
     // HDA spec §3.3.14, sequential ISS → OSS → BSS. Today: input slot at
