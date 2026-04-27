@@ -30,6 +30,7 @@
 
 #include "devices/nvme.h"
 #include "devices/rtl8169.h"
+#include "devices/parport-pci.h"
 #include "devices/sound-hda.h"
 
 #include "devices/gpio-sifive.h"
@@ -1041,6 +1042,178 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_ns16550a_1bridge_1stats(JNIEn
         stats[1] = (jlong)b->total_popped;
         stats[2] = (jlong)b->total_fed;
         stats[3] = (jlong)b->total_consumed;
+        stats[4] = (jlong)b->tx_dropped;
+    }
+    (*env)->SetLongArrayRegion(env, out, 0, 5, stats);
+}
+
+/*
+ * Parport JNI bridge
+ *
+ * Wires the NetMos 9900 PCI parport's bidirectional API (forward write
+ * callback + reverse-channel inject) into a pair of Java-facing
+ * primitives. Mirrors the NS16550A bridge shape: poll() drains forward
+ * bytes (guest → Java), feed() injects reverse bytes (Java → guest via
+ * IEEE 1284 nibble-mode reads).
+ *
+ * Threading: the forward write callback fires on the guest's MMIO write
+ * thread (no parport device lock held — see parport-pci.c's mmio_write).
+ * Java-side poll/feed runs on whatever JVM thread calls in. Ring access
+ * is guarded by `lock`. Reverse-channel feed delegates to
+ * parport_pci_inject_byte which takes the parport device's spinlock
+ * internally; we don't hold our bridge lock across that call.
+ *
+ * Overflow policy: forward writes that outrun Java's drain drop the
+ * oldest bytes in the TX ring (latency over completeness, same as the
+ * UART bridge — printing rarely needs perfect retention). Reverse feed
+ * back-pressures: if the device's 256-byte input ring is full, feed()
+ * returns a short count and the caller retries.
+ */
+
+#define JNI_PARPORT_RING_SIZE 65536
+
+typedef struct {
+    pci_dev_t* dev;
+    spinlock_t lock;
+    ringbuf_t  tx;              // guest forward writes → Java drain
+
+    uint64_t   total_pushed;    // bytes guest has written (Centronics strobes)
+    uint64_t   total_popped;    // bytes Java has drained from tx
+    uint64_t   total_fed;       // bytes Java has tried to inject
+    uint64_t   total_accepted;  // bytes actually accepted into device ring
+    uint64_t   tx_dropped;      // bytes dropped on tx overflow
+} jni_parport_bridge_t;
+
+// Forward-write callback: guest strobed a byte. Push to TX ring with
+// drop-oldest overflow handling.
+static void jni_parport_write(void* user_data, uint8_t byte)
+{
+    jni_parport_bridge_t* b = user_data;
+    if (b == NULL) return;
+    scoped_spin_lock (&b->lock) {
+        if (ringbuf_space(&b->tx) < 1) {
+            uint8_t dropped;
+            if (ringbuf_read(&b->tx, &dropped, 1) == 1) {
+                b->tx_dropped += 1;
+            }
+        }
+        if (ringbuf_write(&b->tx, &byte, 1) == 1) {
+            b->total_pushed += 1;
+        }
+    }
+}
+
+/*
+ * Attach a NetMos 9900 PCI parport wired to a JNI bridge. Returns a
+ * bridge handle (jlong); the underlying pci_dev_t is freed automatically
+ * when the owning machine is freed.
+ *
+ * Returns 0 on failure.
+ *
+ * Note: the bridge struct itself is leaked on machine destruction —
+ * matches the existing parport-pci.c registration pattern, where the
+ * device's MMIO remove() frees its private state but doesn't reach
+ * back into our bridge. The leak is per-machine and per-init, in the
+ * tens-of-bytes range.
+ */
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_parport_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                          jlong machine)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    jni_parport_bridge_t* b = safe_new_obj(jni_parport_bridge_t);
+    ringbuf_create(&b->tx, JNI_PARPORT_RING_SIZE);
+
+    pci_dev_t* dev = parport_pci_init_auto((rvvm_machine_t*)(size_t)machine,
+                                           jni_parport_write,
+                                           b);
+    if (dev == NULL) {
+        ringbuf_destroy(&b->tx);
+        free(b);
+        return 0;
+    }
+    b->dev = dev;
+    return (jlong)(size_t)b;
+}
+
+/*
+ * Drain up to `out.length` bytes of forward data (guest writes) into
+ * the supplied byte[]. Returns count actually drained. Non-blocking.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_parport_1bridge_1poll(JNIEnv* env, jclass cls, //
+                                                                         jlong handle, jbyteArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return 0;
+    jni_parport_bridge_t* b   = (jni_parport_bridge_t*)(size_t)handle;
+    jsize                 cap = (*env)->GetArrayLength(env, out);
+    if (cap <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, out, NULL);
+    if (buf == NULL) return 0;
+
+    size_t got = 0;
+    scoped_spin_lock (&b->lock) {
+        got = ringbuf_read(&b->tx, buf, cap);
+        b->total_popped += got;
+    }
+    (*env)->ReleaseByteArrayElements(env, out, buf, 0);
+    return (jint)got;
+}
+
+/*
+ * Push up to `in.length` bytes into the parport's reverse-channel ring
+ * (Java → guest). Returns the count actually accepted; may be less than
+ * `in.length` if the device's 256-byte input ring fills up. Caller
+ * should retry the unsent tail later.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_parport_1bridge_1feed(JNIEnv* env, jclass cls, //
+                                                                         jlong handle, jbyteArray in)
+{
+    UNUSED(cls);
+    if (handle == 0 || in == NULL) return 0;
+    jni_parport_bridge_t* b   = (jni_parport_bridge_t*)(size_t)handle;
+    jsize                 len = (*env)->GetArrayLength(env, in);
+    if (len <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, in, NULL);
+    if (buf == NULL) return 0;
+
+    // Inject one byte at a time so we can stop cleanly at the first
+    // refusal — parport_pci_inject_byte has its own internal spinlock,
+    // so we mustn't hold ours across the call.
+    jint accepted = 0;
+    for (jint i = 0; i < len; i++) {
+        if (!parport_pci_inject_byte(b->dev, (uint8_t)buf[i])) break;
+        accepted++;
+    }
+    (*env)->ReleaseByteArrayElements(env, in, buf, JNI_ABORT);
+
+    scoped_spin_lock (&b->lock) {
+        b->total_fed      += (uint64_t)len;
+        b->total_accepted += (uint64_t)accepted;
+    }
+    return accepted;
+}
+
+/*
+ * Fill a long[5] with {pushed, popped, fed, accepted, tx_dropped}.
+ * Skips silently if the array is null or too short.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_parport_1bridge_1stats(JNIEnv* env, jclass cls, //
+                                                                          jlong handle, jlongArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return;
+    jni_parport_bridge_t* b = (jni_parport_bridge_t*)(size_t)handle;
+    if ((*env)->GetArrayLength(env, out) < 5) return;
+
+    jlong stats[5];
+    scoped_spin_lock (&b->lock) {
+        stats[0] = (jlong)b->total_pushed;
+        stats[1] = (jlong)b->total_popped;
+        stats[2] = (jlong)b->total_fed;
+        stats[3] = (jlong)b->total_accepted;
         stats[4] = (jlong)b->tx_dropped;
     }
     (*env)->SetLongArrayRegion(env, out, 0, 5, stats);
