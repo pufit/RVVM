@@ -186,6 +186,13 @@ PUBLIC pci_dev_t* parport_pci_init(pci_bus_t* pci_bus,
         // lspci correctly shows the MosChip MCS9900 ID.
         .subsys_vendor_id = 0xA000,
         .subsys_device_id = 0x2000,
+        // BAR 0 is an I/O port BAR. parport_pc's PCI probe uses
+        // pci_resource_start() and feeds the result into inb/outb,
+        // which on RISC-V Linux translates through the PCI bridge's
+        // I/O space mapping (advertised in the device tree). A
+        // Memory BAR lands at an address inb() can't reach, and the
+        // SPP probe silently fails to find any data lines.
+        .bar_io_mask      = 0x01,
         .irq_pin          = PCI_IRQ_PIN_INTA,
         .bar[0] = {
             .size        = 8,
