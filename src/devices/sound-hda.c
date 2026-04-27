@@ -362,7 +362,13 @@ typedef struct {
     uint8_t     channel;
     uint32_t    running;       // Guest intent: 1 = stream should be running
     uint32_t    worker_alive;  // Worker lifetime: 1 = worker thread exists
-    uint8_t     fmt;
+    uint16_t    fmt;           // SDnFMT register (HDA spec 7.3.3.10): full 16
+                               // bits — channels(0:3), size(4:6), divisor(8:10),
+                               // multiplier(11:13), base(14). Worker reads this
+                               // to derive the pacing rate; truncating to 8 bits
+                               // loses divisor / multiplier / base and leaves the
+                               // worker pacing as 48 kHz 8-bit mono regardless of
+                               // what the guest configured.
     uint8_t     status;
     uint8_t     left_gain;
     uint8_t     right_gain;
@@ -1183,6 +1189,24 @@ static void sound_hda_output_stream_ctl(sound_hda_dev_t *hda, uint32_t cmd)
     // (sound/hda/hdac_stream.c) polls up to 300×3μs for each transition;
     // without mirroring SRST, both polls time out silently and stream
     // init stalls — visible as "card detected but plays no audio".
+    //
+    // SRST=1 also resets the stream's per-stream registers per spec 3.3.35
+    // ("While in reset, the corresponding stream's registers and associated
+    // stream FIFO are reset"). The visible symptom of skipping this: first
+    // PCM session works, second silently produces no audio. Linux opens a
+    // new substream, snd_hdac_stream_reset cycles SRST, then re-programs
+    // BDL/CBL/FMT — but LPIB and SDnSTS bits retain stale values from the
+    // previous session. The guest's hw_ptr (computed from LPIB) starts at
+    // a non-zero offset for the new buffer, falls out of sync with appl_ptr,
+    // and the writei path lands in an XRUN cascade right away.
+    if (srst && !stream->srst) {
+        // Edge: SRST 0→1. Reset per-stream state that real HW would clear.
+        // Don't touch BDL/FMT/CBL/LVI — Linux will rewrite those after
+        // observing SRST=0. Don't touch ioce/running — those came from the
+        // SDnCTL byte we're about to store on the same write path.
+        stream->lpib   = 0;
+        stream->status = 0;
+    }
     stream->srst = srst;
     stream->ioce = ioce;
 
@@ -1322,8 +1346,17 @@ static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset
             hda->stream_output.bdl_lvi = read_uint32_le(data);
             break;
         case SOUND_HDA_OSD0FMT:
-            // Maybe useful, but guest already plays sound
-            // with different sample rates correctly.
+            // Store the full 16-bit SDnFMT value so the stream worker can
+            // derive bytes-per-frame and sample rate from it (HDA spec
+            // 7.3.3.10: channels in bits 0:3, sample size 4:6, divisor
+            // 8:10, multiplier 11:13, base-rate select 14). Dropping this
+            // write left fmt=0 forever, which the worker decoded as 8-bit
+            // mono 48 kHz — pacing was correct only by accident when the
+            // codec was locked to 16-bit mono 48 kHz (the bytes_per_frame
+            // miscalculation cancelled out). With wider rate advertisement
+            // any non-48 kHz / non-16-bit stream paces wrong, producing
+            // host PCM underrun cycles audible as buzz / dropout / silence.
+            hda->stream_output.fmt = read_uint16_le(data);
             break;
         case SOUND_HDA_OSD0BDPL:
             hda->stream_output.bdl_lo = read_uint32_le(data);
