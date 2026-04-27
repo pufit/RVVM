@@ -552,6 +552,12 @@ struct sound_hda_dev_s {
     uint32_t    corb_lo;
     uint32_t    corb_hi;
     uint16_t    corb_rp;
+    uint8_t     corb_rprst;    // CORBRP bit 15 (RST). RW handshake state:
+                               // SW writes 1 → HW echoes 1 on read; SW writes
+                               // 0 → echoes 0. Linux's azx_clear_corbrp polls
+                               // for both transitions (§3.3.21). Stored
+                               // separately from corb_rp so the walk can use
+                               // corb_rp as a clean entry index.
     uint16_t    corb_wp;
     uint32_t    corb_size;
     uint8_t     corbctl;       // §3.3.22 — CORBRUN/CMEIE; round-trip only
@@ -872,13 +878,26 @@ static void gr_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
     sound_hda_corb_wp_write(hda, v);
 }
 
+static uint32_t gr_corb_rp_read(sound_hda_dev_t *hda)
+{
+    // §3.3.21: bit 15 (CORBRPRST) is RW with a handshake — software
+    // writes 1, polls for 1 (HW acknowledgment), writes 0, polls for
+    // 0. We echo the stored corb_rprst flag for the readback so
+    // Linux's azx_clear_corbrp loop terminates cleanly. Bits 7:0 hold
+    // the actual RP value.
+    return ((uint32_t)(hda->corb_rprst & 1u) << 15) | (hda->corb_rp & 0xFFu);
+}
+
 static void gr_corb_rp_write(sound_hda_dev_t *hda, uint32_t v)
 {
-    // §3.3.21: bit 15 self-clears RP. Spec also requires CORBCTL.CORBRUN
-    // to be 0 before resetting RP — "or else DMA transfer may be
-    // corrupted." Our CORB consumer runs synchronously under hda->lock
-    // so there's no real corruption window, but a guest that violates
-    // this (writes RP reset while CORBRUN=1) is bug-checking against
+    // §3.3.21: bit 15 = CORBRPRST. Writing 1 resets RP and the bit
+    // reads back as 1; writing 0 clears the bit and stores the new
+    // RP value (low 8 bits).
+    //
+    // Spec also requires CORBCTL.CORBRUN to be 0 before resetting RP —
+    // "or else DMA transfer may be corrupted." Our CORB consumer runs
+    // synchronously under hda->lock so there's no real corruption
+    // window, but a guest that violates this is bug-checking against
     // spec-conformant hardware, so silently ignore the reset to match.
     if (v & 0x8000u) {
         if (hda->corbctl & 0x2u) {
@@ -886,9 +905,11 @@ static void gr_corb_rp_write(sound_hda_dev_t *hda, uint32_t v)
                                " CORBRUN=1; ignored per §3.3.21"));
             return;
         }
-        hda->corb_rp = 0;
+        hda->corb_rprst = 1;
+        hda->corb_rp    = 0;
     } else {
-        hda->corb_rp = v & 0x7Fu;
+        hda->corb_rprst = 0;
+        hda->corb_rp    = v & 0xFFu;
     }
 }
 
@@ -1032,7 +1053,7 @@ static const gr_reg_t gr_regs[] = {
     GR_RW(SOUND_HDA_CORB_LO,            4, corb_lo),
     GR_RW(SOUND_HDA_CORB_HI,            4, corb_hi),
     GR_ACTION(SOUND_HDA_CORB_WP,        2, corb_wp,  NULL, gr_corb_wp_write,         "CORBWP"    ),
-    GR_ACTION(SOUND_HDA_CORB_RP,        2, corb_rp,  NULL, gr_corb_rp_write,         "CORBRP"    ),
+    GR_ACTION(SOUND_HDA_CORB_RP,        2, corb_rp,  gr_corb_rp_read, gr_corb_rp_write, "CORBRP" ),
     GR_RW(SOUND_HDA_CORB_CTRL,          1, corbctl),
     GR_ACTION(SOUND_HDA_CORB_STATUS,    1, corbsts,  NULL, gr_corbsts_write,         "CORBSTS"   ),
     GR_ACTION(SOUND_HDA_CORB_SIZE,      1, corb_size, gr_corb_size_read, gr_corb_size_write, "CORBSIZE"),
@@ -1308,7 +1329,15 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_SUB_NODE_COUNT:
-            return 0x00030002; // 3 Subnodes (NIDs 2, 3, 4) starting at NID 2
+            // §7.3.4.3 format: (starting_nid << 16) | count.
+            //   bits 23:16 = starting NID, bits 7:0 = total count.
+            // 3 subnodes (NIDs 2, 3, 4) starting at NID 2 → 0x00020003.
+            // (Bug history: the Beep widget commit a2a4255 swapped the
+            // bytes here as 0x00030002 — "starting NID 3, count 2" —
+            // which made Linux iterate NIDs 3, 4 only and miss NID 2
+            // entirely. Codec dump showed no Node 0x02; autoconfig
+            // found pin 0x03 with no converter; PCM creation failed.)
+            return 0x00020003;
 
         case CODEC_PARAM_FUNC_GROUP_TYPE:
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
