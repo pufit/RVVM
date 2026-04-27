@@ -587,12 +587,16 @@ struct sound_hda_dev_s {
     uint8_t     beep_gain;
     uint32_t    beep_running;  // guest intent: 1 = generate tone
     uint32_t    beep_worker_alive;
-    uint8_t     pin_ctrl;      // NID 3 pin widget control byte (§7.3.3.13).
+    uint8_t     pin_ctrl_out;  // NID 3 pin widget control byte (§7.3.3.13).
                                // Bit 6 OUT_ENABLE, 5 IN_ENABLE, 7 HPHN, 0 VREF.
                                // Default = OUT_ENABLE so probe-time GET returns
                                // the same value the previous hardcoded handler
-                               // did. Multi-pin codecs would extend this to a
-                               // per-NID array.
+                               // did.
+    uint8_t     pin_ctrl_in;   // NID 6 (Mic-In) pin widget control byte.
+                               // Linux's HDA generic pin power-up sets bit 5
+                               // IN_ENABLE before recording starts; default to
+                               // 0 so the guest can detect that it owns the
+                               // configuration.
 
     sound_hda_stream_t streams[HDA_STREAMS_TOTAL];
     sound_subsystem_t  subsystem;
@@ -1266,8 +1270,13 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
     switch (payload) {
         case CODEC_PARAM_SUB_NODE_COUNT:
             // §7.3.4.3: (starting_nid << 16) | count.
-            // 3 subnodes (NIDs 2, 3, 4) starting at NID 2.
-            return 0x00020003;
+            // 5 subnodes (NIDs 2..6) starting at NID 2:
+            //   2 = Output Converter (DAC)
+            //   3 = Pin Out (Line-Out)
+            //   4 = Beep Generator
+            //   5 = Input Converter (ADC)
+            //   6 = Pin In (Mic-In)
+            return 0x00020005;
 
         case CODEC_PARAM_FUNC_GROUP_TYPE:
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
@@ -1391,11 +1400,83 @@ static uint32_t sound_hda_codec_beep_cmd(uint32_t payload)
     }
 }
 
+// NID = 5 — Audio Input Converter widget (ADC, HDA spec §7.2.3.2).
+// Type code 1 (bits 23:20 of widget caps). Conn list points at the mic
+// pin (NID 6). Mono — see the comment on the output converter for why
+// we deliberately don't advertise STEREO. Linux's HDA generic codec
+// will create a "Capture Volume" / "Capture Switch" alsa control bound
+// to the AMP_GAIN_MUTE verbs on this widget's input amp.
+static uint32_t sound_hda_codec_input_cmd(uint32_t payload)
+{
+    switch (payload) {
+        case CODEC_PARAM_AUDIO_WIDGET_CAPS:
+            return CODEC_PARAM_AUDIO_WIDGET_CAPS_INPUT
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_FORMAT_OVR
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OVR
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_IN
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_CONN_LIST;
+
+        case CODEC_PARAM_SUPP_PCM_SIZE_RATES:
+            return HDA_PCM_SIZE_16
+                 | HDA_RATE_BIT(44100) | HDA_RATE_BIT(48000);
+
+        case CODEC_PARAM_SUPP_STREAM_FMTS:
+            return CODEC_PARAM_SUPP_STREAM_FMTS_PCM;
+
+        case CODEC_PARAM_INPUT_AMP_CAPS:
+            // Mirror the output-side amp caps so dB scaling matches what
+            // alsamixer shows for the playback side. Mute capability is
+            // important: Linux's "Capture Switch" defaults to muted on
+            // some codecs, and without MUTE_CAP the toggle is silently
+            // ignored.
+            return CODEC_PARAM_OUTPUT_AMP_CAPS_MUTE_CAP
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET;
+
+        case CODEC_PARAM_CONN_LIST_LEN:
+            return 1;   // single source — the mic pin
+
+        default:
+            return 0;
+    }
+}
+
+// NID = 6 — Pin Complex configured as a Mic-In (HDA spec §7.2.3.3).
+// Type code 4 (Pin Complex). Reports as a fixed internal mic — no
+// jack-detect circuitry (the Java backend or host ALSA decides whether
+// audio is "available"; presence is not modeled at the wire level).
+static uint32_t sound_hda_codec_pin_input_cmd(uint32_t payload)
+{
+    switch (payload) {
+        case CODEC_PARAM_AUDIO_WIDGET_CAPS:
+            // Pin widgets advertise no STEREO (mono mic) and no
+            // CONN_LIST (a Pin In is a leaf source — the input
+            // converter pulls from it, not the other way around).
+            return CODEC_PARAM_AUDIO_WIDGET_CAPS_PIN;
+
+        case CODEC_PARAM_PIN_CAPS:
+            // INPUT_CAPABLE is the bit that makes the codec generic
+            // recognize this pin as a recording source. We advertise
+            // VRef Hi-Z + Ground only; "Mic Boost" needs the proper
+            // VRef levels and a separate amp on the pin which we don't
+            // model. Linux is happy with the bare minimum.
+            return CODEC_PARAM_PIN_CAPS_INPUT
+                 | CODEC_PARAM_PIN_CAPS_VREF_CTRL_HIZ
+                 | CODEC_PARAM_PIN_CAPS_VREF_CTRL_GROUND;
+
+        default:
+            return 0;
+    }
+}
+
 #define NODE_ID_ROOT       0 // Root node
-#define NODE_ID_FG_OUTPUT  1 // Output function group
-#define NODE_ID_OUTPUT     2 // Output converter widget
-#define NODE_ID_PIN_OUTPUT 3 // Pin output widget
+#define NODE_ID_FG_OUTPUT  1 // Audio Function Group
+#define NODE_ID_OUTPUT     2 // Output converter widget (DAC)
+#define NODE_ID_PIN_OUTPUT 3 // Pin output widget (Line-Out / Speaker)
 #define NODE_ID_BEEP       4 // Beep Generator widget (§7.2.3.8)
+#define NODE_ID_INPUT      5 // Input converter widget (ADC)
+#define NODE_ID_PIN_INPUT  6 // Pin input widget (Mic-In)
 
 static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t nid, uint32_t verb, uint32_t payload)
 {
@@ -1487,6 +1568,11 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
         payload = cmd & 0xFFFF;
     }
 
+    // The single input stream lives at descriptor index 0 (NO_IN=1
+    // means streams[0..0] are inputs). hda_output_stream uses the same
+    // convention for the output side.
+    sound_hda_stream_t *input_stream = &hda->streams[0];
+
     switch (verb) {
         case VERB_GET_PARAMETER:
             // We define NID count and start indices in CODEC_PARAM_SUB_NODE_COUNT
@@ -1506,6 +1592,12 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             case NODE_ID_BEEP:
                 response = sound_hda_codec_beep_cmd(payload);
                 break;
+            case NODE_ID_INPUT:
+                response = sound_hda_codec_input_cmd(payload);
+                break;
+            case NODE_ID_PIN_INPUT:
+                response = sound_hda_codec_pin_input_cmd(payload);
+                break;
             }
 
             break;
@@ -1521,18 +1613,17 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             response = hda->power_state | (hda->power_state << 4);
             break;
         case VERB_GET_PIN_WIDGET_CTRL:
-            // §7.3.3.13: returns the pin widget control byte. Single
-            // pin widget today (NID 3); multi-pin codecs would key by nid.
-            response = hda->pin_ctrl;
+            // §7.3.3.13: returns the pin widget control byte, per-NID.
+            if (nid == NODE_ID_PIN_INPUT) response = hda->pin_ctrl_in;
+            else                          response = hda->pin_ctrl_out;
             break;
         case VERB_SET_PIN_WIDGET_CTRL:
             // §7.3.3.13: payload bits 7:0 are the new pin control byte.
-            // Was silently dropped — Linux's pin power-up writes this
-            // to enable output, then reads it back to confirm. With no
-            // store the read returned a constant; round-trip happened
-            // to look correct only because Linux happens to write the
-            // same OUT_ENABLE bit the GET hardcoded.
-            hda->pin_ctrl = payload & 0xFFu;
+            // Linux's pin power-up sets the widget's enable bit before
+            // recording (IN_ENABLE for mic, OUT_ENABLE for speaker)
+            // and reads back to confirm. Track each pin separately.
+            if (nid == NODE_ID_PIN_INPUT) hda->pin_ctrl_in  = payload & 0xFFu;
+            else                          hda->pin_ctrl_out = payload & 0xFFu;
             break;
         case VERB_GET_PIN_SENSE:
             response = VERB_GET_PIN_SENSE_PRESENSE_PLUGGED;
@@ -1547,13 +1638,17 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             sound_hda_beep_set(hda, payload & 0xFFu);
             break;
         case VERB_GET_AMP_GAIN_MUTE:
-            // Beep widget (NID 4) has its own mono amp; stream amp
-            // (NID 2) goes through the per-stream dispatcher below.
+            // Beep widget (NID 4) has its own mono amp; converter widgets
+            // (NID 2 output, NID 5 input) route to their per-stream
+            // dispatcher.
             if (nid == NODE_ID_BEEP) {
                 response = ((uint32_t)(hda->beep_mute & 1u) << 7)
                          | (hda->beep_gain & 0x7Fu);
             } else if (nid == NODE_ID_OUTPUT) {
                 response = sound_hda_codec_stream_cmd(hda_output_stream(hda),
+                                                      nid, verb, payload);
+            } else if (nid == NODE_ID_INPUT) {
+                response = sound_hda_codec_stream_cmd(input_stream,
                                                       nid, verb, payload);
             }
             break;
@@ -1569,16 +1664,35 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             } else if (nid == NODE_ID_OUTPUT) {
                 sound_hda_codec_stream_cmd(hda_output_stream(hda),
                                            nid, verb, payload);
+            } else if (nid == NODE_ID_INPUT) {
+                sound_hda_codec_stream_cmd(input_stream, nid, verb, payload);
             }
             break;
         case VERB_GET_CONN_LIST_ENTRY:
-            response = NODE_ID_OUTPUT;
+            // NID 3 (Pin Out) ← NID 2 (DAC).
+            // NID 5 (ADC)     ← NID 6 (Pin In).
+            // Other NIDs have no conn list, return 0.
+            if (nid == NODE_ID_INPUT)        response = NODE_ID_PIN_INPUT;
+            else if (nid == NODE_ID_PIN_OUTPUT) response = NODE_ID_OUTPUT;
+            else                             response = 0;
             break;
         case VERB_GET_CONFIG_DEFAULT:
-            response = VERB_GET_CONFIG_DEFAULT_CONNECTIVITY_JACK
-                     | VERB_GET_CONFIG_DEFAULT_DEVICE_LINE_OUT
-                     | VERB_GET_CONFIG_DEFAULT_ASSOCIATION_DEFAULT
-                     | VERB_GET_CONFIG_DEFAULT_COLOR_ORANGE;
+            // Per-pin Configuration Default. NID 3 = Line-Out (orange,
+            // jack); NID 6 = Mic-In (pink, fixed internal mic).
+            if (nid == NODE_ID_PIN_INPUT) {
+                response = VERB_GET_CONFIG_DEFAULT_CONNECTIVITY_FIXED
+                         | VERB_GET_CONFIG_DEFAULT_DEVICE_MIC_IN
+                         | VERB_GET_CONFIG_DEFAULT_COLOR_PINK
+                         // Different default-association from the output
+                         // pin so the codec generic doesn't try to group
+                         // them as one multichannel jack pair.
+                         | (2u << 4);   // Default Association = 2
+            } else {
+                response = VERB_GET_CONFIG_DEFAULT_CONNECTIVITY_JACK
+                         | VERB_GET_CONFIG_DEFAULT_DEVICE_LINE_OUT
+                         | VERB_GET_CONFIG_DEFAULT_ASSOCIATION_DEFAULT
+                         | VERB_GET_CONFIG_DEFAULT_COLOR_ORANGE;
+            }
             break;
         case VERB_FUNCTION_RESET:
             // §7.3.3.33: reset FG widgets to power-on values (Configuration
@@ -1593,7 +1707,18 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                 s->left_mute  = 1;
                 s->right_mute = 1;
                 s->gain_q15   = 0;
-                hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+                hda->pin_ctrl_out = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+            }
+            if (nid == NODE_ID_FG_OUTPUT || nid == NODE_ID_INPUT) {
+                input_stream->fmt        = 0;
+                input_stream->channel    = 0;
+                input_stream->stream     = 0;
+                input_stream->left_gain  = HDA_AMP_OFFSET;
+                input_stream->right_gain = HDA_AMP_OFFSET;
+                input_stream->left_mute  = 1;
+                input_stream->right_mute = 1;
+                input_stream->gain_q15   = 0;
+                hda->pin_ctrl_in = 0;
             }
             response = 0;
             break;
@@ -1601,6 +1726,9 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             switch (nid) {
             case NODE_ID_OUTPUT:
                 response = sound_hda_codec_stream_cmd(hda_output_stream(hda), nid, verb, payload);
+                break;
+            case NODE_ID_INPUT:
+                response = sound_hda_codec_stream_cmd(input_stream, nid, verb, payload);
                 break;
             }
             break;
@@ -1865,6 +1993,133 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
     }
 }
 
+// Input-direction drain. Mirror of sound_hda_stream_drain: same BDL
+// walk, same fmt-derived pacing, but data flows from subsystem.read
+// into guest memory via pci_get_dma_ptr. The backend may return short;
+// we pad the rest of the BDL entry with silence so the pacing rate
+// stays bit-exact regardless of mic availability.
+static void sound_hda_stream_drain_input(sound_hda_stream_t *stream)
+{
+    sound_hda_dev_t *hda = stream->hda;
+
+    uint16_t fmt              = stream->fmt;
+    uint32_t channels         = (fmt & 0xF) + 1;
+    uint32_t bytes_per_sample = hda_fmt_container_bytes[(fmt >> 4) & 7];
+    uint32_t mult_code        = (fmt >> 11) & 7;
+    uint32_t div              = ((fmt >> 8) & 7) + 1;
+    uint32_t base_hz          = (fmt & (1u << 14)) ? 44100 : 48000;
+    bool fmt_valid = (fmt & (1u << 15)) == 0
+                  && bytes_per_sample != 0
+                  && mult_code <= 3;
+    uint64_t sample_rate_hz = (uint64_t)base_hz * (mult_code + 1) / div;
+    uint32_t bytes_per_frame = channels * bytes_per_sample;
+    uint64_t SAMPLE_RATE_BYTES_PER_SEC = sample_rate_hz * bytes_per_frame;
+    if (!fmt_valid || SAMPLE_RATE_BYTES_PER_SEC == 0) {
+        atomic_store_uint32_relax(&stream->running, 0);
+        return;
+    }
+
+    uint64_t paced_start_ns  = 0;
+    uint64_t paced_bytes_out = 0;
+
+    uint32_t total = stream->bdl_lvi + 1;
+    uint64_t bdl_bytes = (uint64_t)total * 16;
+    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, bdl_bytes);
+    if (dma == NULL) {
+        atomic_store_uint32_relax(&stream->running, 0);
+        return;
+    }
+
+    while (atomic_load_uint32_relax(&stream->running)) {
+        for (uint32_t i = 0; i < total; ++i) {
+            uint64_t *bdle = &dma[i * 2];
+            uint64_t addr = bdle[0];
+            uint32_t len  = bdle[1] & 0xFFFFFFFF;
+            uint8_t  ioc  = bdle[1] >> 32 & 1;
+
+            if (len == 0) {
+                DO_ONCE(rvvm_debug("sound-hda: zero-length BDL entry at idx %u"
+                                   " (input) — spec §3.6.3", i));
+                if (!atomic_load_uint32_relax(&stream->running)) return;
+                if (ioc) {
+                    spin_lock(&hda->lock);
+                    stream->status |= 0x04;
+                    uint8_t  ioce = stream->ioce;
+                    uint32_t ic   = hda->intr_ctrl;
+                    spin_unlock(&hda->lock);
+                    if (ioce && (ic & (1u << 31))
+                             && (ic & (1u << stream->intsts_bit))) {
+                        pci_send_irq(hda->pci_func, 0);
+                    }
+                }
+                continue;
+            }
+
+            // Fill the guest buffer for this BDL entry. Pull from the
+            // backend; pad the remainder (or the whole thing if no
+            // backend) with silence so the guest sees a steady
+            // sample-rate stream regardless of host-side gaps.
+            void *dst = pci_get_dma_ptr(hda->pci_func, addr, len);
+            if (dst != NULL) {
+                size_t got = 0;
+                if (hda->subsystem.read != NULL) {
+                    got = hda->subsystem.read(&hda->subsystem, dst, len);
+                    if (got > len) got = len;
+                }
+                if (got < len) {
+                    memset((uint8_t*)dst + got, 0, (size_t)len - got);
+                }
+            }
+
+            // Same shutdown check as the output path — a backend abort
+            // or remove() can race the BDL walk; bail before any further
+            // pci_send_irq / pci_get_dma_ptr calls outlive the device.
+            if (!atomic_load_uint32_relax(&stream->running))
+                return;
+
+            // Wall-clock pacing — same shape as the output drain.
+            paced_bytes_out += len;
+            uint64_t now_ns = rvtimer_clocksource(1000000000ULL);
+            if (paced_start_ns == 0) {
+                paced_start_ns = now_ns;
+            } else {
+                uint64_t expected_ns = paced_bytes_out * 1000000000ULL
+                                     / SAMPLE_RATE_BYTES_PER_SEC;
+                uint64_t elapsed_ns  = now_ns - paced_start_ns;
+                if (expected_ns > elapsed_ns) {
+                    sleep_ns(expected_ns - elapsed_ns);
+                } else if (elapsed_ns > expected_ns + 100000000ULL) {
+                    paced_start_ns  = now_ns;
+                    paced_bytes_out = 0;
+                }
+            }
+
+            stream->lpib += len;
+            if (stream->lpib >= stream->bdl_len)
+                stream->lpib = 0;
+            if (stream->bdl_len > 0 && stream->lpib > stream->bdl_len)
+                atomic_store_uint32_relax(&stream->running, 0);
+
+            // §3.3.36 BCIS for input: set after the last byte of an IOC
+            // descriptor has been *removed from the FIFO* (i.e.,
+            // committed to memory). For us, that's after the memset/
+            // memcpy above, so latch it here.
+            if (ioc) {
+                spin_lock(&hda->lock);
+                stream->status |= 0x04;
+                uint8_t  ioce = stream->ioce;
+                uint32_t ic   = hda->intr_ctrl;
+                spin_unlock(&hda->lock);
+                bool gie = (ic & (1u << 31)) != 0;
+                bool sie = (ic & (1u << stream->intsts_bit)) != 0;
+                if (ioce && gie && sie) {
+                    pci_send_irq(hda->pci_func, 0);
+                }
+            }
+        }
+    }
+}
+
 // Beep generator worker (HDA spec §7.2.3.8 / §7.3.3.31). Runs whenever
 // hda->beep_running is set; generates a square wave at 48000/(4*divider)
 // Hz mixed at the beep widget's amp gain, fed to the same backend the
@@ -1979,7 +2234,11 @@ static void *sound_hda_stream_worker(void *arg)
     // drain — we exit. Either way, exactly one worker runs at a time per
     // stream descriptor.
     for (;;) {
-        sound_hda_stream_drain(stream);
+        if (stream->dir == HDA_STREAM_DIR_INPUT) {
+            sound_hda_stream_drain_input(stream);
+        } else {
+            sound_hda_stream_drain(stream);
+        }
 
         atomic_store_uint32_relax(&stream->worker_alive, 0);
 
@@ -2028,10 +2287,13 @@ static void sound_hda_stream_ctl_action(sound_hda_dev_t *hda,
     stream->ctl_strm = strm;
 
     // Publish RUN regardless of direction so MMIO reads round-trip it.
-    // Only output streams spawn a worker; input/bidir RUN is observable
-    // but inert (no backend source today).
+    // Both input and output streams spawn a worker — input pulls from
+    // subsystem.read into guest memory, output pushes from guest memory
+    // through subsystem.write. Bidir streams stay inert (we never set
+    // NO_BSS != 0 today).
     atomic_store_uint32_relax(&stream->running, run ? 1u : 0u);
-    if (run && stream->dir == HDA_STREAM_DIR_OUTPUT) {
+    if (run && (stream->dir == HDA_STREAM_DIR_OUTPUT
+             || stream->dir == HDA_STREAM_DIR_INPUT)) {
         // running=1 must be published before the CAS so a worker
         // exiting concurrently sees it on its post-clear re-check.
         if (atomic_cas_uint32(&stream->worker_alive, 0, 1)) {
@@ -2162,7 +2424,8 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
     // Default to OUT_ENABLE so a guest that doesn't explicitly enable
     // the pin (or a minimalist driver that skips that step) still gets
     // audio. Linux's HDA generic pin power-up overwrites this anyway.
-    sound_hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+    sound_hda->pin_ctrl_out = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+    sound_hda->pin_ctrl_in  = 0;
 
     // Beep widget defaults — same convention as the main amp:
     // mute=1, gain=Offset (0 dB) per spec §7.3.3.7. Linux's HDA generic

@@ -18,14 +18,27 @@ typedef struct sound_subsystem_t sound_subsystem_t;
 struct sound_subsystem_t {
     void *sound_data;
     void (*write)(sound_subsystem_t *subsystem, void *data, size_t size);
+    // Optional. Pulls up to `size` bytes of mono S16LE PCM into `data`,
+    // returns the count actually filled. Used by HDA's input stream
+    // drain to fetch capture data from the host.
+    //
+    // CONTRACT: must be non-blocking. If the backend has nothing
+    // available, return 0 — the input drain pads the rest of the
+    // request with silence and keeps the guest's stream rate stable.
+    // Blocking here would distort the guest's perceived sample clock.
+    // NULL = no capture support; the input stream worker still runs
+    // (so the guest's BDL bookkeeping isn't disturbed) but writes
+    // silence the entire time.
+    size_t (*read)(sound_subsystem_t *subsystem, void *data, size_t size);
     // Optional. Called from sound_hda_remove() before it waits for the
-    // stream worker to exit. Backends whose write() can block (host
-    // ALSA PCM, any IPC sink without an internal queue) must implement
-    // this so a blocked worker unblocks quickly — otherwise remove()
-    // waits on a wedged backend while the caller expects to free the
-    // machine. Non-blocking backends (ring buffers, capture fixtures)
-    // can leave this NULL. After abort() returns, subsequent write()
-    // calls are allowed to be no-ops; the worker is tearing down.
+    // stream worker to exit. Backends whose write() / read() can block
+    // (host ALSA PCM, any IPC sink without an internal queue) must
+    // implement this so a blocked worker unblocks quickly — otherwise
+    // remove() waits on a wedged backend while the caller expects to
+    // free the machine. Non-blocking backends (ring buffers, capture
+    // fixtures) can leave this NULL. After abort() returns, subsequent
+    // write() / read() calls are allowed to be no-ops; the worker is
+    // tearing down.
     void (*abort)(sound_subsystem_t *subsystem);
 };
 
