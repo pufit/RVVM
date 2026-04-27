@@ -570,6 +570,12 @@ struct sound_hda_dev_s {
     uint32_t    irr;           // §3.4.2  — Immediate Response Input
     uint16_t    ics;           // §3.4.3  — Immediate Command Status
     uint32_t    power_state;
+    uint8_t     pin_ctrl;      // NID 3 pin widget control byte (§7.3.3.13).
+                               // Bit 6 OUT_ENABLE, 5 IN_ENABLE, 7 HPHN, 0 VREF.
+                               // Default = OUT_ENABLE so probe-time GET returns
+                               // the same value the previous hardcoded handler
+                               // did. Multi-pin codecs would extend this to a
+                               // per-NID array.
 
     sound_hda_stream_t streams[HDA_STREAMS_TOTAL];
     sound_subsystem_t  subsystem;
@@ -1213,6 +1219,13 @@ static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t re
 
     rirb[0] = response;
     rirb[1] = cad;       // response_ex (codec address in bits 3:0)
+    // We're called from sound_hda_codec_cmd, which runs with hda->lock
+    // held (gr_corb_wp_write / gr_ics_write paths). RVVM's pci_send_irq
+    // → rvvm_send_irq just queues the IRQ into the interrupt controller;
+    // the vCPU thread picks it up on its next scheduling slot, never
+    // synchronously re-entering our MMIO from this thread. So holding
+    // hda->lock across the call is safe — the worst case is a brief
+    // serialisation of the vCPU's IRQ-handler MMIO behind our unlock.
     pci_send_irq(hda->pci_func, 0);
 }
 
@@ -1505,7 +1518,18 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             response = hda->power_state | (hda->power_state << 4);
             break;
         case VERB_GET_PIN_WIDGET_CTRL:
-            response = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+            // §7.3.3.13: returns the pin widget control byte. Single
+            // pin widget today (NID 3); multi-pin codecs would key by nid.
+            response = hda->pin_ctrl;
+            break;
+        case VERB_SET_PIN_WIDGET_CTRL:
+            // §7.3.3.13: payload bits 7:0 are the new pin control byte.
+            // Was silently dropped — Linux's pin power-up writes this
+            // to enable output, then reads it back to confirm. With no
+            // store the read returned a constant; round-trip happened
+            // to look correct only because Linux happens to write the
+            // same OUT_ENABLE bit the GET hardcoded.
+            hda->pin_ctrl = payload & 0xFFu;
             break;
         case VERB_GET_PIN_SENSE:
             response = VERB_GET_PIN_SENSE_PRESENSE_PLUGGED;
@@ -1527,16 +1551,13 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             //
             // Targets the Audio Function Group (NID 1); for our topology
             // that's a single output converter (NID 2) plus pin output
-            // (NID 3). Reset the converter's codec-side state — the pin
-            // widget has no mutable state we track.
+            // (NID 3). Reset both the converter's codec-side state and
+            // the pin widget control byte to power-on defaults.
             if (nid == NODE_ID_FG_OUTPUT || nid == NODE_ID_OUTPUT) {
                 sound_hda_stream_t *s = hda_output_stream(hda);
                 s->fmt        = 0;
                 s->channel    = 0;
                 s->stream     = 0;
-                // Spec §7.3.3.7: "After codec reset, this 'Gain' field
-                // must default to the 'Offset' value, meaning that all
-                // amplifiers, by default, are configured to 0 dB gain."
                 // Spec §7.3.3.7: gain defaults to Offset (0 dB), mute
                 // "should default to 1 on codec reset." Linux's HDA
                 // generic codec unmutes primary output paths during the
@@ -1547,6 +1568,9 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                 s->left_mute  = 1;
                 s->right_mute = 1;
                 s->gain_q15   = 0;
+                // §7.3.3.13: pin widget control resets to power-on
+                // default. Match init.
+                hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
             }
             response = 0;
             break;
@@ -1875,6 +1899,15 @@ static void sound_hda_stream_ctl_action(sound_hda_dev_t *hda,
 
     if (srst && !stream->srst) {
         // Edge: SRST 0→1. Reset per-stream state that real HW would clear.
+        // Spec §3.3.35 also requires "The RUN bit must be cleared before
+        // SRST is asserted" — software's job. A misbehaving guest that
+        // sets SRST while RUN=1 would on real HW still get a reset (the
+        // stream registers and FIFO clear regardless), with RUN going to
+        // 0 as part of the reset. Force-stop the worker first to match;
+        // otherwise we'd have running=1 and no usable BDL state, and the
+        // worker would spin against zeroed pointers until guest re-RUNs.
+        atomic_store_uint32_relax(&stream->running, 0);
+        run            = 0;   // override the same write's RUN bit too
         stream->lpib   = 0;
         stream->status = 0;
     }
@@ -1955,19 +1988,31 @@ static void sound_hda_controller_reset(sound_hda_dev_t *hda)
     // zeroed: any new dma fetch will fail and the worker exits.
 }
 
-// CORB write-pointer action (HDA spec §3.3.20). Used by the global
-// register table's CORBWP entry. Full DMA model would have a CORB
-// engine consume entries from RP+1..WP at its own pace; we instead
-// synchronously fetch the entry at WP and dispatch it inline.
-// Functionally OK for Linux which bumps WP after every entry, but a
-// guest that batches multiple commands before bumping WP loses all but
-// the last — a known limitation.
+// CORB consumer (HDA spec §3.3.20 + §4.4.1.4). On every CORBWP write,
+// walk from RP+1 to the new WP, dispatching each verb and advancing
+// RP. A real implementation would do this asynchronously via a DMA
+// engine gated on CORBCTL.CORBRUN; we treat the WP write as the
+// trigger. Functionally indistinguishable from the spec model for
+// guests that block waiting on RIRB responses (which is everyone).
+//
+// Earlier this fetched only the entry at the new WP and never advanced
+// RP — Linux works because it bumps WP after every entry, but a guest
+// that batches commands before bumping WP would silently drop all but
+// the last. Now spec-conformant.
 static void sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
 {
-    hda->corb_wp = v & 0x7Fu;
-    uint32_t *cmd = pci_get_dma_ptr(hda->pci_func,
-                                    (rvvm_addr_t)hda->corb_lo + hda->corb_wp * 4, 4);
-    if (cmd) sound_hda_codec_cmd(hda, *cmd);
+    hda->corb_wp = v & 0xFFu;
+    if (hda->corb_size == 0) return;
+    uint32_t entries = hda->corb_size / 4;
+    // Map the whole CORB once, then index in. pci_get_dma_ptr returning
+    // NULL means the guest hasn't programmed a valid base yet; bail.
+    uint32_t *corb = pci_get_dma_ptr(hda->pci_func, hda->corb_lo,
+                                     (size_t)entries * 4);
+    if (corb == NULL) return;
+    while (hda->corb_rp != hda->corb_wp) {
+        hda->corb_rp = (hda->corb_rp + 1) % entries;
+        sound_hda_codec_cmd(hda, corb[hda->corb_rp]);
+    }
 }
 
 static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
@@ -2026,6 +2071,12 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
     // until power-on reset, preserved across CRST. Linux's HDA driver
     // reads STATESTS during probe to enumerate codecs.
     sound_hda->statests = 0x0001;
+
+    // §7.3.3.13 pin widget control: power-on default is impl-specific.
+    // Default to OUT_ENABLE so a guest that doesn't explicitly enable
+    // the pin (or a minimalist driver that skips that step) still gets
+    // audio. Linux's HDA generic pin power-up overwrites this anyway.
+    sound_hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
 
     // Initialize per-stream identity. Descriptor index = SIE/SIS bit per
     // HDA spec §3.3.14, sequential ISS → OSS → BSS. Today: input slot at
