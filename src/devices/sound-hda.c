@@ -811,11 +811,14 @@ static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset,
         case SOUND_HDA_OUTPAY:      v = 0x3C;                 break;
         case SOUND_HDA_INPAY:       v = 0x1D;                 break;
         case SOUND_HDA_GLOBAL_CTRL:
-            // Force CRST=1 (controller out of reset) and UNSOL=1 (accept
-            // unsolicited responses) on every read; the device is always
-            // "running" once it has been mapped.
-            hda->gctl |= (1u << 8) | 1u;
-            v = hda->gctl;
+            // GCTL (HDA spec §3.3.7). Bit 0 CRST is RWS — readback
+            // reflects what was last written so guest reset polls see
+            // both CRST=0 (in-reset) and CRST=1 (out-of-reset)
+            // transitions. Bit 8 UNSOL is force-on: we accept
+            // unsolicited responses unconditionally (the codec doesn't
+            // currently emit any, so this is purely advertised
+            // capability). Other bits round-trip from the stored value.
+            v = hda->gctl | (1u << 8);
             break;
         case SOUND_HDA_INTR_CTRL:   v = hda->intr_ctrl;             break;
         case SOUND_HDA_INTSTS:      v = sound_hda_compute_intsts(hda); break;
@@ -1494,6 +1497,50 @@ static void sound_hda_stream_ctl_action(sound_hda_dev_t *hda,
     UNUSED(hda);
 }
 
+// GCTL CRST=0 → controller reset (HDA spec §3.3.7). All state machines,
+// FIFOs, and MMIO registers clear except WAKEEN, STATESTS, and CRST
+// itself. Software is responsible for clearing CORB/RIRB RUN bits and
+// stream RUN bits before asserting CRST=0 — but a guest that ignores
+// that requirement (or a fresh probe after a previous session left
+// streams running) shouldn't leave us with stale state. Halt every
+// stream worker via the running flag, zero ring-buffer pointers, and
+// reset per-stream MMIO state. UNSOL bit (8) follows CRST.
+static void sound_hda_controller_reset(sound_hda_dev_t *hda)
+{
+    for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        sound_hda_stream_t *s = &hda->streams[i];
+        atomic_store_uint32_relax(&s->running, 0);
+        s->lpib     = 0;
+        s->status   = 0;
+        s->srst     = 0;
+        s->ioce     = 0;
+        s->feie     = 0;
+        s->deie     = 0;
+        s->stripe   = 0;
+        s->tp       = 0;
+        s->ctl_strm = 0;
+        s->bdl_lo   = 0;
+        s->bdl_hi   = 0;
+        s->bdl_len  = 0;
+        s->bdl_lvi  = 0;
+        s->fmt      = 0;
+    }
+    hda->corb_rp = 0;
+    hda->corb_wp = 0;
+    hda->rirb_rp = 0;
+    hda->rirb_wp = 0;
+    hda->intr_ctrl = 0;
+    // WAKEEN, STATESTS, power_state, codec subsystem registers are
+    // explicitly preserved per spec ("only cleared on power-on reset").
+    // We don't model wake bits today, so the preservation is moot.
+    //
+    // We don't wait for workers to drain — they bail on their next
+    // running check (within one BDL entry), and the guest's reset poll
+    // loop reads CRST=0 immediately. A worker still finishing a backend
+    // write while we return is safe because the BDL pointers are now
+    // zeroed: any new dma fetch will fail and the worker exits.
+}
+
 // CORB write-pointer write (HDA spec §3.3.20). The full DMA model would
 // have a CORB engine consume entries from RP+1..WP at its own pace; we
 // instead synchronously fetch the entry at WP and dispatch it inline.
@@ -1520,7 +1567,17 @@ static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset
     uint32_t v = mmio_load(data, size);
 
     switch (offset) {
-        case SOUND_HDA_GLOBAL_CTRL: hda->gctl      = v; break;
+        case SOUND_HDA_GLOBAL_CTRL: {
+            // CRST 1→0: enter reset. Halt streams + zero ring/state.
+            // CRST 0→1: leave reset (no extra action; readback now
+            // returns 1 once the new gctl is stored).
+            uint32_t prev = hda->gctl;
+            hda->gctl = v;
+            if ((prev & 1u) && !(v & 1u)) {
+                sound_hda_controller_reset(hda);
+            }
+            break;
+        }
         case SOUND_HDA_INTR_CTRL:   hda->intr_ctrl = v; break;
         case SOUND_HDA_CORB_LO:     hda->corb_lo   = v; break;
         case SOUND_HDA_CORB_HI:     hda->corb_hi   = v; break;
