@@ -57,6 +57,12 @@ typedef struct {
     // SVID at 0x2C[15:0], SSID at 0x2E[15:0].
     uint16_t        subsys_vendor_id;
     uint16_t        subsys_device_id;
+    // BAR type bitmap (PCI spec §6.2.5.1). Bit N = 1 means BAR N is an
+    // I/O port BAR rather than the default Memory BAR. Used by drivers
+    // that emulate legacy I/O-port-only silicon (parport_pc, vintage
+    // serial chips, etc.) on platforms where I/O ports are routed
+    // through the PCI bridge's I/O range. Default 0 = all Memory.
+    uint8_t         bar_io_mask;
     rvvm_mmio_dev_t bar[PCI_FUNC_BARS];
     rvvm_mmio_dev_t expansion_rom;
 } pci_func_desc_t;
