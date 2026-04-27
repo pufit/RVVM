@@ -181,6 +181,8 @@ struct rvvm_pci_function {
     uint16_t vendor_id;
     uint16_t device_id;
     uint16_t class_code;
+    uint16_t subsys_vendor_id;   // 0 → use the bus default (CERN/ECP/EDU)
+    uint16_t subsys_device_id;
     uint8_t  prog_if;
     uint8_t  rev;
     uint8_t  irq_pin;
@@ -477,12 +479,14 @@ static pci_func_t* pci_attach_func_internal(pci_bus_t* bus, const pci_func_desc_
     pci_func_t* func = safe_new_obj(pci_func_t);
     func->bus        = bus;
 
-    func->vendor_id  = desc->vendor_id;
-    func->device_id  = desc->device_id;
-    func->class_code = desc->class_code;
-    func->prog_if    = desc->prog_if;
-    func->rev        = desc->rev;
-    func->irq_pin    = desc->irq_pin;
+    func->vendor_id        = desc->vendor_id;
+    func->device_id        = desc->device_id;
+    func->class_code       = desc->class_code;
+    func->subsys_vendor_id = desc->subsys_vendor_id;
+    func->subsys_device_id = desc->subsys_device_id;
+    func->prog_if          = desc->prog_if;
+    func->rev              = desc->rev;
+    func->irq_pin          = desc->irq_pin;
 
     func->addr = bus_addr;
 
@@ -649,7 +653,16 @@ static bool pci_bus_read(rvvm_mmio_dev_t* ecam, void* data, size_t offset, uint8
             break;
         }
         case PCI_REG_SSID_SVID:
-            val = 0x510010DC;
+            // Per-device override if set in the descriptor; otherwise
+            // fall back to the bus's CERN/ECP/EDU placeholder so existing
+            // devices that don't care about subsys IDs round-trip the
+            // same value they always have.
+            if (func->subsys_vendor_id || func->subsys_device_id) {
+                val = ((uint32_t)func->subsys_device_id << 16)
+                    | (uint32_t)func->subsys_vendor_id;
+            } else {
+                val = 0x510010DC;
+            }
             break;
         case PCI_REG_EXPANSION_ROM:
             if (func->expansion_rom) {

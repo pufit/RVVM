@@ -49,6 +49,14 @@ typedef struct {
     uint8_t         prog_if;
     uint8_t         rev;
     uint8_t         irq_pin;
+    // Subsystem Vendor ID and Subsystem ID (PCI cfg offset 0x2C, §6.2.4).
+    // Many Linux drivers match strict subsys IDs in their PCI tables (e.g.
+    // parport_pc's netmos_9900 entry requires subsys 0xA000:0x2000); leave
+    // these zero to inherit the bus's default placeholder, set to assert
+    // a specific OEM card identity. Bytes are laid out little-endian:
+    // SVID at 0x2C[15:0], SSID at 0x2E[15:0].
+    uint16_t        subsys_vendor_id;
+    uint16_t        subsys_device_id;
     rvvm_mmio_dev_t bar[PCI_FUNC_BARS];
     rvvm_mmio_dev_t expansion_rom;
 } pci_func_desc_t;
