@@ -333,33 +333,60 @@ static const uint8_t hda_fmt_container_bytes[8] = {
 #undef HDA_BITS_BYTES_INIT
 };
 
-// HDA gain step → Q15 amplitude factor. Our codec advertises
-// CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE=3 (encoded "(N+1)*0.25 dB" → 1.0
-// dB per step), NUMSTEPS=74, OFFSET=74 (HDA spec §7.3.4.10), so
-// step=74 → 0 dB and step=0 → -74 dB. Convert without libm: factor a
-// dB attenuation as `floor(atten/6)` halvings (each 6 dB ≈ ÷2) plus a
-// 6-entry mantissa table for the 0..5 dB residue.
+// Output amp caps: chosen to give a 16 dB range with 0.5 dB resolution,
+// matching what consumer HDA codecs (Realtek ALC1220, IDT 92HD83, etc.)
+// typically advertise. The wider 74 dB range we used to advertise made
+// amixer's linear percent display feel useless because most of the
+// slider sat in perceptually-inaudible territory.
 //
-// Accuracy is within ~0.5 dB of `pow(10, -atten/20)` across the full
-// range — well below the user's perceptual threshold (~1 dB), and
-// fixed-point so it works whether USE_FPU is enabled or not.
-static const uint16_t hda_gain_db_mantissa[6] = {
-    32768, // -0 dB → 1.000
-    29205, // -1 dB → 0.891
-    26029, // -2 dB → 0.794
-    23197, // -3 dB → 0.708
-    20675, // -4 dB → 0.631
-    18430, // -5 dB → 0.562
+//   STEPSIZE encoded value: actual_step_dB = (encoded + 1) * 0.25
+//                           → encoded 1 = 0.5 dB per step
+//   NUMSTEPS encoded value: maximum gain step value (0..NumSteps incl.)
+//                           → 32 → 33 step values, range = 32 * 0.5 = 16 dB
+//   OFFSET   encoded value: gain step that produces 0 dB
+//                           → 32 → step 32 = 0 dB, step 0 = -16 dB
+// Bit packing happens in the CODEC_PARAM_OUTPUT_AMP_CAPS_* macros below;
+// these symbolic forms are kept up here so hda_gain_to_q15 and the
+// amp-reset defaults can reference them by name.
+#define HDA_AMP_NUMSTEPS         32
+#define HDA_AMP_OFFSET           32
+#define HDA_AMP_STEPSIZE_ENC      1   // → 0.5 dB per step
+
+// HDA gain step → Q15 amplitude factor. Reads HDA_AMP_OFFSET and
+// HDA_AMP_STEPSIZE_ENC so changing the advertised amp caps doesn't
+// break the conversion math.
+//
+// Convert without libm: each 6 dB ≈ ÷2, so the factor decomposes into
+// `shift` halvings plus a 12-entry half-dB mantissa for the 0..5.5 dB
+// residue. Accuracy is within ~0.1 dB of `pow(10, -atten/20)` — well
+// below the perceptual threshold (~1 dB) — and fixed-point so it works
+// whether USE_FPU is enabled or not.
+static const uint16_t hda_gain_db_mantissa_half[12] = {
+    32768, // -0.0 dB → 1.000
+    30924, // -0.5 dB → 0.944
+    29205, // -1.0 dB → 0.891
+    27593, // -1.5 dB → 0.842
+    26029, // -2.0 dB → 0.794
+    24574, // -2.5 dB → 0.750
+    23197, // -3.0 dB → 0.708
+    21900, // -3.5 dB → 0.668
+    20675, // -4.0 dB → 0.631
+    19518, // -4.5 dB → 0.596
+    18430, // -5.0 dB → 0.562
+    17398, // -5.5 dB → 0.531
 };
 
 static int32_t hda_gain_to_q15(uint8_t gain, uint8_t mute)
 {
-    if (mute)        return 0;
-    if (gain >= 74)  return 32768;        // 0 dB or above (clamp)
-    int atten = 74 - (int)gain;
-    int shift = atten / 6;
-    int rem   = atten % 6;
-    return (int32_t)hda_gain_db_mantissa[rem] >> shift;
+    if (mute)                     return 0;
+    if (gain >= HDA_AMP_OFFSET)   return 32768;   // 0 dB or above (clamp)
+    // attenuation in quarter-dB units = (offset - gain) * step_quarter_db,
+    // where step_quarter_db = (encoded + 1).
+    int atten_qdb = ((int)HDA_AMP_OFFSET - (int)gain) * (HDA_AMP_STEPSIZE_ENC + 1);
+    int atten_hdb = atten_qdb / 2;        // half-dB units
+    int shift     = atten_hdb / 12;       // 6 dB = 12 half-dB ≈ ÷2
+    int rem       = atten_hdb % 12;
+    return (int32_t)hda_gain_db_mantissa_half[rem] >> shift;
 }
 
 // Sized MMIO load/store. Use these in every register handler instead of
@@ -412,9 +439,12 @@ static inline void mmio_store(void *data, uint8_t size, uint32_t val)
 
 #define CODEC_PARAM_OUTPUT_AMP_CAPS                      0x12
 #define CODEC_PARAM_OUTPUT_AMP_CAPS_MUTE_CAP             (   1 << 31)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE             (   3 << 16)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS             (0x4a <<  8)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET               (0x4a <<  0) // Why 0x4a?
+// Bit-packed forms of the amp caps for the GET_PARAMETER response.
+// The numeric constants live up at the top of the file (HDA_AMP_*) so
+// hda_gain_to_q15 and the reset paths can reference them by name.
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE             (HDA_AMP_STEPSIZE_ENC << 16)
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS             (HDA_AMP_NUMSTEPS     <<  8)
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET               (HDA_AMP_OFFSET       <<  0)
 
 #define CODEC_PARAM_CONN_LIST_LEN                        0x0E
 #define CODEC_PARAM_SUPP_POWER_STATES                    0x0F
@@ -1242,14 +1272,14 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                 // Spec §7.3.3.7: "After codec reset, this 'Gain' field
                 // must default to the 'Offset' value, meaning that all
                 // amplifiers, by default, are configured to 0 dB gain."
-                // Our advertised Offset is 0x4A = 74. Default mute=0
-                // (unmuted) — spec recommends mute=1 generally, but
-                // there's no beep pin, no jack-detect amp interaction,
-                // and Linux's HDA generic codec unmutes during widget
-                // power-up anyway; defaulting unmuted matches the
-                // historical behaviour where the worker ignored mute.
-                s->left_gain  = 0x4A;
-                s->right_gain = 0x4A;
+                // Default mute=0 (unmuted). Spec recommends mute=1
+                // generally, but there's no beep pin, no jack-detect amp
+                // interaction, and Linux's HDA generic codec unmutes
+                // during widget power-up anyway; defaulting unmuted
+                // matches the historical behaviour where the worker
+                // ignored mute.
+                s->left_gain  = HDA_AMP_OFFSET;
+                s->right_gain = HDA_AMP_OFFSET;
                 s->left_mute  = 0;
                 s->right_mute = 0;
                 s->gain_q15   = 32768;  // unity (0 dB)
@@ -1796,8 +1826,8 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
         }
         // Spec §7.3.3.7: amp gain defaults to Offset (0 dB), unmuted.
         // Set the cached worker factor to unity to match.
-        s->left_gain  = 0x4A;
-        s->right_gain = 0x4A;
+        s->left_gain  = HDA_AMP_OFFSET;
+        s->right_gain = HDA_AMP_OFFSET;
         s->gain_q15   = 32768;
     }
 
