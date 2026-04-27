@@ -210,6 +210,22 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     snd_pcm_hw_params_set_buffer_size_near(pcm_device, params, &buffer_frames);
     snd_pcm_hw_params(pcm_device, params);
 
+    // Prime the host PCM with two periods of silence before any guest
+    // audio shows up. PipeWire (and modern PulseAudio) finishes
+    // wiring up the DSP graph for a freshly-opened snd_pcm_t lazily —
+    // the first writei into the stream pays for graph construction,
+    // node activation, and reservation of the period grid. Without
+    // priming, the very first guest period lands in a partially-set-
+    // up sink and the leading 5-20 ms is dropped or fed into a
+    // not-yet-running mixer, producing the audible "ta" transient at
+    // stream start that users have reported.
+    //
+    // Two periods is the minimum that reliably absorbs the wake-up
+    // cost across PipeWire and PulseAudio; one period works on
+    // PipeWire alone, three is overkill and adds startup latency.
+    int16_t silence[960 * 2 /* periods × period_frames × 1 channel */] = {0};
+    snd_pcm_writei(pcm_device, silence, sizeof(silence) / sizeof(int16_t));
+
     subsystem->pcm_handle = pcm_device;
 
     sound->sound_data = subsystem;
