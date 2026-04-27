@@ -361,19 +361,20 @@ static const uint8_t hda_fmt_container_bytes[8] = {
 // residue. Accuracy is within ~0.1 dB of `pow(10, -atten/20)` — well
 // below the perceptual threshold (~1 dB) — and fixed-point so it works
 // whether USE_FPU is enabled or not.
+// Verified vs `round(pow(10, -dB/20) * 32768)`; max error ±0.0002 dB.
 static const uint16_t hda_gain_db_mantissa_half[12] = {
     32768, // -0.0 dB → 1.000
-    30924, // -0.5 dB → 0.944
+    30935, // -0.5 dB → 0.944
     29205, // -1.0 dB → 0.891
-    27593, // -1.5 dB → 0.842
+    27571, // -1.5 dB → 0.841
     26029, // -2.0 dB → 0.794
-    24574, // -2.5 dB → 0.750
-    23197, // -3.0 dB → 0.708
+    24573, // -2.5 dB → 0.750
+    23198, // -3.0 dB → 0.708
     21900, // -3.5 dB → 0.668
     20675, // -4.0 dB → 0.631
-    19518, // -4.5 dB → 0.596
-    18430, // -5.0 dB → 0.562
-    17398, // -5.5 dB → 0.531
+    19519, // -4.5 dB → 0.596
+    18427, // -5.0 dB → 0.562
+    17396, // -5.5 dB → 0.531
 };
 
 static int32_t hda_gain_to_q15(uint8_t gain, uint8_t mute)
