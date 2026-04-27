@@ -570,6 +570,17 @@ struct sound_hda_dev_s {
     uint32_t    irr;           // §3.4.2  — Immediate Response Input
     uint16_t    ics;           // §3.4.3  — Immediate Command Status
     uint32_t    power_state;
+    // Beep Generator widget (NID 4, §7.2.3.8 / §7.3.3.31). Independent
+    // of stream playback — beep tone runs whenever beep_divider != 0,
+    // regardless of whether any stream descriptor is RUN. Worker
+    // lifecycle parallels the per-stream worker: spawn on first non-zero
+    // SET_BEEP_GENERATION via CAS on beep_worker_alive, the worker
+    // exits when it sees beep_running=0.
+    uint8_t     beep_divider;  // §7.3.3.31 payload — 0 = off, N = 48000/(4N) Hz
+    uint8_t     beep_mute;
+    uint8_t     beep_gain;
+    uint32_t    beep_running;  // guest intent: 1 = generate tone
+    uint32_t    beep_worker_alive;
     uint8_t     pin_ctrl;      // NID 3 pin widget control byte (§7.3.3.13).
                                // Bit 6 OUT_ENABLE, 5 IN_ENABLE, 7 HPHN, 0 VREF.
                                // Default = OUT_ENABLE so probe-time GET returns
@@ -820,6 +831,7 @@ static uint32_t sound_hda_wallclk(void);
 static void     sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v);
 static void     sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd);
 static void     sound_hda_controller_reset(sound_hda_dev_t *hda);
+static void     sound_hda_beep_set(sound_hda_dev_t *hda, uint8_t divider);
 
 // === Global register callbacks ===
 static uint32_t gr_gctl_read(sound_hda_dev_t *hda)
@@ -1094,6 +1106,8 @@ static void sound_hda_remove(rvvm_mmio_dev_t* dev)
     for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
         atomic_store_uint32_relax(&hda->streams[i].running, 0);
     }
+    // Same for the beep worker (lifetime parallels stream workers).
+    atomic_store_uint32_relax(&hda->beep_running, 0);
     // Unblock any worker stuck inside subsystem.write before we start
     // waiting. Without this, blocking backends (ALSA PCM mid-xrun, IPC
     // sinks, any callback that doesn't poll running itself) stall
@@ -1109,11 +1123,10 @@ static void sound_hda_remove(rvvm_mmio_dev_t* dev)
     // use-after-free the moment the caller frees the PCI state.
     uint32_t waited_ms = 0;
     for (;;) {
-        bool any_alive = false;
-        for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        bool any_alive = atomic_load_uint32_relax(&hda->beep_worker_alive);
+        for (size_t i = 0; !any_alive && i < HDA_STREAMS_TOTAL; ++i) {
             if (atomic_load_uint32_relax(&hda->streams[i].worker_alive)) {
                 any_alive = true;
-                break;
             }
         }
         if (!any_alive) break;
@@ -1256,7 +1269,7 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_SUB_NODE_COUNT:
-            return 0x00020002; // 2 Subnode, StartNid = 2
+            return 0x00030002; // 3 Subnodes (NIDs 2, 3, 4) starting at NID 2
 
         case CODEC_PARAM_FUNC_GROUP_TYPE:
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
@@ -1370,10 +1383,41 @@ static uint32_t sound_hda_codec_pin_output_cmd(uint32_t payload)
     }
 }
 
+// NID = 4 — Beep Generator widget (HDA spec §7.2.3.8 / §7.3.4.6).
+// Type code 7 (bits 23:20 of widget caps). Includes AMP_OUT so Linux
+// exposes a "Beep Playback Volume" / "Beep Playback Switch" alsa
+// control bound to the per-widget AMP_GAIN_MUTE verbs.
+static uint32_t sound_hda_codec_beep_cmd(uint32_t payload)
+{
+    switch (payload) {
+        case CODEC_PARAM_AUDIO_WIDGET_CAPS:
+            // Type=7 (Beep Generator), AMP_OVR + AMP_OUT so the widget
+            // exposes its own amp instead of inheriting the FG's. No
+            // STEREO bit (beep is a single-channel tone). No CONN_LIST
+            // — per spec §7.2.3.8 "this node is never listed on any
+            // other node's connection list."
+            return (7u << 20)
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OVR
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OUT;
+
+        case CODEC_PARAM_OUTPUT_AMP_CAPS:
+            // Same amp range as the main output — keeps the per-control
+            // dB ↔ percent mapping consistent in alsamixer.
+            return CODEC_PARAM_OUTPUT_AMP_CAPS_MUTE_CAP
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET;
+
+        default:
+            return 0;
+    }
+}
+
 #define NODE_ID_ROOT       0 // Root node
 #define NODE_ID_FG_OUTPUT  1 // Output function group
-#define NODE_ID_OUTPUT     2 // Output
-#define NODE_ID_PIN_OUTPUT 3 // Pin output
+#define NODE_ID_OUTPUT     2 // Output converter widget
+#define NODE_ID_PIN_OUTPUT 3 // Pin output widget
+#define NODE_ID_BEEP       4 // Beep Generator widget (§7.2.3.8)
 
 static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t nid, uint32_t verb, uint32_t payload)
 {
@@ -1503,6 +1547,9 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             case NODE_ID_PIN_OUTPUT:
                 response = sound_hda_codec_pin_output_cmd(payload);
                 break;
+            case NODE_ID_BEEP:
+                response = sound_hda_codec_beep_cmd(payload);
+                break;
             }
 
             break;
@@ -1533,6 +1580,40 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             break;
         case VERB_GET_PIN_SENSE:
             response = VERB_GET_PIN_SENSE_PRESENSE_PLUGGED;
+            break;
+        case VERB_GET_BEEP_GENERATION:
+            // §7.3.3.31: response bits 7:0 are the current divider; 0 = off.
+            response = hda->beep_divider;
+            break;
+        case VERB_SET_BEEP_GENERATION:
+            // §7.3.3.31: payload bits 7:0 are divider. 0 disables;
+            // non-zero starts a tone at 48000 / (4 * divider) Hz.
+            sound_hda_beep_set(hda, payload & 0xFFu);
+            break;
+        case VERB_GET_AMP_GAIN_MUTE:
+            // Beep widget (NID 4) has its own mono amp; stream amp
+            // (NID 2) goes through the per-stream dispatcher below.
+            if (nid == NODE_ID_BEEP) {
+                response = ((uint32_t)(hda->beep_mute & 1u) << 7)
+                         | (hda->beep_gain & 0x7Fu);
+            } else if (nid == NODE_ID_OUTPUT) {
+                response = sound_hda_codec_stream_cmd(hda_output_stream(hda),
+                                                      nid, verb, payload);
+            }
+            break;
+        case VERB_SET_AMP_GAIN_MUTE:
+            if (nid == NODE_ID_BEEP) {
+                // Mono — spec §7.3.3.7: "if the widget only supports a
+                // single channel, [right] bits are ignored." Either
+                // LEFT or RIGHT in the payload writes the single value.
+                if (payload & VERB_SET_AMP_GAIN_MUTE_OUTPUT) {
+                    hda->beep_mute = (payload & VERB_SET_AMP_GAIN_MUTE_MUTE) ? 1u : 0u;
+                    hda->beep_gain = payload & VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
+                }
+            } else if (nid == NODE_ID_OUTPUT) {
+                sound_hda_codec_stream_cmd(hda_output_stream(hda),
+                                           nid, verb, payload);
+            }
             break;
         case VERB_GET_CONN_LIST_ENTRY:
             response = NODE_ID_OUTPUT;
@@ -1844,6 +1925,107 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
     }
 }
 
+// Beep generator worker (HDA spec §7.2.3.8 / §7.3.3.31). Runs whenever
+// hda->beep_running is set; generates a square wave at 48000/(4*divider)
+// Hz mixed at the beep widget's amp gain, fed to the same backend the
+// stream worker uses. Same lockless single-worker pattern as the stream
+// worker — beep_worker_alive CAS gate, post-exit re-check for missed
+// wakeups.
+static void *sound_hda_beep_worker(void *arg)
+{
+    sound_hda_dev_t *hda = arg;
+    // Square-wave state: alternates sign every half-period.
+    int16_t  sample_value = 0;
+    uint32_t half_period_remaining = 0;
+    uint32_t cur_divider = 0;
+
+    uint64_t paced_start_ns  = 0;
+    uint64_t paced_bytes_out = 0;
+    const uint32_t SAMPLE_RATE_HZ = 48000;
+    const uint32_t BYTES_PER_SAMPLE = 2;            // 16-bit mono
+
+    for (;;) {
+        while (atomic_load_uint32_relax(&hda->beep_running)) {
+            uint8_t divider = hda->beep_divider;
+            if (divider == 0) {
+                atomic_store_uint32_relax(&hda->beep_running, 0);
+                break;
+            }
+            // Re-derive the half-period if divider changed mid-tone.
+            if (divider != cur_divider) {
+                cur_divider = divider;
+                // freq = 48000 / (4 * divider), period_samples = 4*divider
+                half_period_remaining = 2u * (uint32_t)divider;
+                sample_value = 0;
+            }
+
+            // Generate one ~10 ms chunk per iteration so divider /
+            // gain / mute changes propagate quickly.
+            int16_t buf[480];   // 480 samples = 10 ms @ 48 kHz
+            uint8_t mute = hda->beep_mute;
+            uint8_t gain = hda->beep_gain;
+            int32_t q15  = hda_gain_to_q15(gain, mute);
+            for (size_t i = 0; i < 480; ++i) {
+                if (half_period_remaining == 0) {
+                    // Toggle. Use ~50% of full-scale so the tone is
+                    // present but not deafening before the per-widget
+                    // amp scales it.
+                    sample_value = (sample_value > 0) ? -16384 : 16384;
+                    half_period_remaining = 2u * cur_divider;
+                }
+                buf[i] = (int16_t)(((int32_t)sample_value * q15) >> 15);
+                half_period_remaining--;
+            }
+
+            if (hda->subsystem.write != NULL) {
+                hda->subsystem.write(&hda->subsystem, buf, sizeof(buf));
+            }
+
+            // Wall-clock pacing — same shape as sound_hda_stream_drain.
+            paced_bytes_out += sizeof(buf);
+            uint64_t now_ns = rvtimer_clocksource(1000000000ULL);
+            if (paced_start_ns == 0) {
+                paced_start_ns = now_ns;
+            } else {
+                uint64_t expected_ns = paced_bytes_out * 1000000000ULL
+                                     / ((uint64_t)SAMPLE_RATE_HZ * BYTES_PER_SAMPLE);
+                uint64_t elapsed_ns  = now_ns - paced_start_ns;
+                if (expected_ns > elapsed_ns) {
+                    sleep_ns(expected_ns - elapsed_ns);
+                } else if (elapsed_ns > expected_ns + 100000000ULL) {
+                    paced_start_ns  = now_ns;
+                    paced_bytes_out = 0;
+                }
+            }
+        }
+
+        atomic_store_uint32_relax(&hda->beep_worker_alive, 0);
+        if (!atomic_load_uint32_relax(&hda->beep_running))
+            return NULL;
+        if (!atomic_cas_uint32(&hda->beep_worker_alive, 0, 1))
+            return NULL;
+        // Re-claimed; loop continues with the new beep state.
+    }
+}
+
+// Beep enable/disable — driven by VERB_SET_BEEP_GENERATION. Divider
+// 0 stops; non-zero starts (or updates the frequency of) the tone.
+// Single tone at a time across the whole codec; beep is intrinsically
+// global per spec §7.2.3.8 ("the codec generates the beep tone on all
+// Pin Complexes that are currently configured as outputs").
+static void sound_hda_beep_set(sound_hda_dev_t *hda, uint8_t divider)
+{
+    hda->beep_divider = divider;
+    if (divider == 0) {
+        atomic_store_uint32_relax(&hda->beep_running, 0);
+        return;
+    }
+    atomic_store_uint32_relax(&hda->beep_running, 1);
+    if (atomic_cas_uint32(&hda->beep_worker_alive, 0, 1)) {
+        thread_create_task(sound_hda_beep_worker, hda);
+    }
+}
+
 static void *sound_hda_stream_worker(void *arg)
 {
     sound_hda_stream_t *stream = arg;
@@ -2077,6 +2259,13 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
     // the pin (or a minimalist driver that skips that step) still gets
     // audio. Linux's HDA generic pin power-up overwrites this anyway.
     sound_hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+
+    // Beep widget defaults — same convention as the main amp:
+    // mute=1, gain=Offset (0 dB) per spec §7.3.3.7. Linux's HDA generic
+    // codec creates "Beep Playback Switch" / "Beep Playback Volume"
+    // alsa controls bound to these via SET_AMP_GAIN_MUTE on NID 4.
+    sound_hda->beep_gain = HDA_AMP_OFFSET;
+    sound_hda->beep_mute = 1;
 
     // Initialize per-stream identity. Descriptor index = SIE/SIS bit per
     // HDA spec §3.3.14, sequential ISS → OSS → BSS. Today: input slot at
