@@ -27,6 +27,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "rvvm_isolation.h"
 #include "rvvm_user.h"
 #include "rvvmlib.h"
+#include "threading.h"
 #include "utils.h"
 
 #include "devices/ata.h"
@@ -202,6 +203,7 @@ static void rvvm_print_help(void)
         "    -nosound         Disable sound support\n"
         "    -parport_test    Attach an emulated NetMos 9900 PCI parallel port\n"
         "    -parport_out ... File to receive parport output (default: /tmp/rvvm-parport0.out)\n"
+        "    -parport_in ...  File/fifo to source parport reverse-channel input from\n"
         "    -nonet           Disable networking\n"
         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
         "    -dtb        ...  Pass custom Device Tree Blob to the machine\n"
@@ -223,6 +225,32 @@ static void parport_main_write_fn(void* user_data, uint8_t byte)
 {
     FILE* fp = (FILE*)user_data;
     if (fp) fputc(byte, fp);
+}
+
+// Reader thread for -parport_in: blocks on read() from a host file or
+// fifo and pushes each byte into the device's reverse-channel ring.
+// EOF / error ends the thread, leaving any further guest reads to see
+// nFault asserted (end-of-data) on Status.
+typedef struct {
+    pci_dev_t* dev;
+    FILE*      fp;
+} parport_in_ctx_t;
+
+static void* parport_in_thread(void* arg)
+{
+    parport_in_ctx_t* ctx = arg;
+    int c;
+    while ((c = fgetc(ctx->fp)) != EOF) {
+        // Spin until the ring has space. Slow guest readers shouldn't
+        // burn the CPU, so back off when full — sched_yield is plenty
+        // for ringbuffer pacing.
+        while (!parport_pci_inject_byte(ctx->dev, (uint8_t)c)) {
+            rvvm_sched_yield();
+        }
+    }
+    fclose(ctx->fp);
+    free(ctx);
+    return NULL;
 }
 
 static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_dev_t* tap)
@@ -394,13 +422,29 @@ static int rvvm_cli_main(int argc, char** argv)
         const char* path = rvvm_getarg("parport_out");
         if (path == NULL) path = "/tmp/rvvm-parport0.out";
         FILE* fp = fopen(path, "wb");
+        pci_dev_t* parport_dev = NULL;
         if (fp) {
             setvbuf(fp, NULL, _IONBF, 0);  // unbuffered — bytes appear immediately
             rvvm_info("parport: writes go to %s", path);
-            parport_pci_init_auto(machine, parport_main_write_fn, fp);
+            parport_dev = parport_pci_init_auto(machine, parport_main_write_fn, fp);
         } else {
             rvvm_warn("parport: failed to open %s, attaching with no backend", path);
-            parport_pci_init_auto(machine, NULL, NULL);
+            parport_dev = parport_pci_init_auto(machine, NULL, NULL);
+        }
+        // Reverse channel: feed bytes from -parport_in <path> into the
+        // ring. Useful for guest-side dd/cat tests of bidirectional 1284.
+        const char* in_path = rvvm_getarg("parport_in");
+        if (parport_dev && in_path) {
+            FILE* in_fp = fopen(in_path, "rb");
+            if (in_fp) {
+                rvvm_info("parport: reverse-channel input from %s", in_path);
+                parport_in_ctx_t* ctx = safe_new_obj(parport_in_ctx_t);
+                ctx->dev = parport_dev;
+                ctx->fp  = in_fp;
+                rvvm_thread_detach(rvvm_thread_create(parport_in_thread, ctx));
+            } else {
+                rvvm_warn("parport: failed to open %s for reverse channel", in_path);
+            }
         }
     }
 
