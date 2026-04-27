@@ -12,6 +12,7 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 #include "atomics.h"
 #include "compiler.h"
 #include "dlib.h"
+#include "rvtimer.h"
 #include "sound-hda.h"
 #include "spinlock.h"
 #include "threading.h"
@@ -135,11 +136,26 @@ static size_t alsa_ring_pop(alsa_subsystem_t *a, uint8_t *dst, size_t n)
 // Capture pump thread: drains ALSA capture continuously into the jitter
 // ring. Period-sized reads (10 ms) keep the host-side latency low; the
 // ring smooths against the HDA worker's BDL-sized fetches.
+//
+// Wall-clock pacing is essential: PipeWire's ALSA shim doesn't always
+// block snd_pcm_readi when it's behind the requested rate (especially
+// through plug::), so a naive tight readi loop blasts through the
+// PipeWire input buffer at whatever rate the host kernel can deliver,
+// often 4× our requested 48 kHz. The drop-oldest ring then surfaces
+// those over-fed bytes as a time-compressed audio stream — same total
+// byte count, but representing 4× as much wall-clock audio compressed
+// into the ring window. Guests pulling at 48 kHz hear a 2-octave pitch
+// shift up. Pacing the pump to BYTES_PER_SEC enforces the rate
+// regardless of ALSA's blocking behavior.
 static void *alsa_capture_pump(void *arg)
 {
     alsa_subsystem_t *alsa = arg;
     int16_t  buf[480];   // 480 mono frames = 10 ms @ 48 kHz
     int xrun_retries = 4;
+
+    const uint64_t BYTES_PER_SEC = 48000ULL * 2;   // mono S16LE
+    uint64_t paced_start_ns = 0;
+    uint64_t paced_bytes_out = 0;
 
     while (!atomic_load_uint32_relax(&alsa->aborted)) {
         snd_pcm_sframes_t n = snd_pcm_readi(alsa->pcm_capture, buf, 480);
@@ -159,7 +175,29 @@ static void *alsa_capture_pump(void *arg)
             // Unrecoverable (ENODEV, EBADFD, ...) — exit the thread.
             return NULL;
         }
-        alsa_ring_push(alsa, (uint8_t*)buf, (size_t)n * 2);
+        size_t bytes = (size_t)n * 2;
+        alsa_ring_push(alsa, (uint8_t*)buf, bytes);
+
+        // Wall-clock pacing: cap the production rate at exactly 48 kHz
+        // mono so we can't ever push faster than the consumer expects,
+        // even if ALSA returns frames non-blockingly.
+        paced_bytes_out += bytes;
+        uint64_t now_ns = rvtimer_clocksource(1000000000ULL);
+        if (paced_start_ns == 0) {
+            paced_start_ns = now_ns;
+        } else {
+            uint64_t expected_ns = paced_bytes_out * 1000000000ULL / BYTES_PER_SEC;
+            uint64_t elapsed_ns  = now_ns - paced_start_ns;
+            if (expected_ns > elapsed_ns) {
+                sleep_ns(expected_ns - elapsed_ns);
+            } else if (elapsed_ns > expected_ns + 500000000ULL) {
+                // Fell more than 500 ms behind (host suspend, very long
+                // GC pauses on a managed-runtime backend, etc.). Rebase
+                // so we don't try to "catch up" by blasting on resume.
+                paced_start_ns  = now_ns;
+                paced_bytes_out = 0;
+            }
+        }
     }
     return NULL;
 }
@@ -348,7 +386,16 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     // open we skip mic support and keep playback functional, since not
     // every host has a usable mic and we don't want to break HDA over
     // it.
-    if (snd_pcm_open(&subsystem->pcm_capture, "default", SND_PCM_STREAM_CAPTURE, 0) < 0) {
+    // Use the "plug:" plugin so alsa-lib transparently does sample-rate
+    // and channel conversion if the underlying device (PipeWire's
+    // default source) isn't natively 48 kHz mono. Without this, opening
+    // the bare "default" device on PipeWire yields whatever rate the
+    // graph quantum is set to (often 96 kHz), our pump drains faster
+    // than 48 kHz and the drop-oldest ring decimates, surfacing as a
+    // pitch shift up of 1-2 octaves on the guest. plug:: collapses all
+    // that into a stable 48 kHz mono S16LE stream regardless of host
+    // configuration.
+    if (snd_pcm_open(&subsystem->pcm_capture, "plug:default", SND_PCM_STREAM_CAPTURE, 0) < 0) {
         rvvm_warn("Failed to open ALSA capture device — microphone disabled");
         subsystem->pcm_capture = NULL;
     } else {
@@ -374,6 +421,12 @@ bool alsa_sound_init(sound_subsystem_t *sound)
                                                &cap_buffer);
         snd_pcm_hw_params(subsystem->pcm_capture, cap_params);
         snd_pcm_hw_params_free(cap_params);
+
+        // Log the rate we actually got — if plug:: didn't take, this
+        // surfaces the real rate so we can debug the pitch shift.
+        rvvm_info("alsa capture: rate=%u channels=%u period=%lu buffer=%lu",
+                  cap_rate, cap_channels,
+                  (unsigned long)cap_period, (unsigned long)cap_buffer);
 
         // ALSA capture opens in "prepared" state, not "running". Without
         // an explicit start(), readi() blocks indefinitely waiting for a
