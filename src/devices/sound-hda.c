@@ -31,7 +31,7 @@ PUSH_OPTIMIZATION_SIZE
 #define SOUND_HDA_GLOBAL_CTRL         0x08 // Global Control
 #define SOUND_HDA_WAKEEN              0x0C // Wake enable
 #define SOUND_HDA_STATESTS            0x0E // State Change Status
-#define SOUND_HDA_GTS                 0x10 // Global status
+#define SOUND_HDA_GSTS                0x10 // Global status
 #define SOUND_HDA_OUTSTRMPAY          0x18 // Output stream payload capability
 #define SOUND_HDA_INSTRMPAY           0x1A // Input stream payload capability
 #define SOUND_HDA_INTR_CTRL           0x20 // Interrupt Control
@@ -52,32 +52,21 @@ PUSH_OPTIMIZATION_SIZE
 #define SOUND_HDA_RIRB_CTRL           0x5C // RIRB Control
 #define SOUND_HDA_RIRB_STATUS         0x5D // RIRB Status
 #define SOUND_HDA_RIRB_SIZE           0x5E // RIRB Size
+#define SOUND_HDA_ICW                 0x60 // Immediate Command Output (§3.4.1)
+#define SOUND_HDA_IRR                 0x64 // Immediate Response Input  (§3.4.2)
+#define SOUND_HDA_ICS                 0x68 // Immediate Command Status  (§3.4.3)
 #define SOUND_HDA_DMA_LO              0x70 // DMA Position Lower Base Address
 #define SOUND_HDA_DMA_HI              0x74 // DMA Position Upper Base Address
+#define SOUND_HDA_WALCLKA             0x2030 // Wall Clock Counter Alias (§3.3.44)
 
-// This implementation assumes 1 input and 1 output streams,
-// so registers are hard coded there.
-#define SOUND_HDA_ISD0                0x80
-#define SOUND_HDA_ISD0CTL             SOUND_HDA_ISD0 + 0x00 // Input Stream Descriptor Control
-#define SOUND_HDA_ISD0STS             SOUND_HDA_ISD0 + 0x03 // Input Stream Descriptor Status
-#define SOUND_HDA_ISD0LPIB            SOUND_HDA_ISD0 + 0x04 // Input Stream Descriptor Link Position in Buffer
-#define SOUND_HDA_ISD0CBL             SOUND_HDA_ISD0 + 0x08 // Input Stream Descriptor Cyclic Buffer Length
-#define SOUND_HDA_ISD0LVI             SOUND_HDA_ISD0 + 0x0C // Input Stream Descriptor Last Valid Index
-#define SOUND_HDA_ISD0FIFOS           SOUND_HDA_ISD0 + 0x10 // Input Stream Descriptor FIFO Size
-#define SOUND_HDA_ISD0FMT             SOUND_HDA_ISD0 + 0x12 // Input Stream Descriptor Format
-#define SOUND_HDA_ISD0BDPL            SOUND_HDA_ISD0 + 0x18 // Input Stream Descriptor BDL Pointer Lower Base Address
-#define SOUND_HDA_ISD0BDPU            SOUND_HDA_ISD0 + 0x1C // Input Stream Descriptor BDL Pointer Upper Base Address
-
-#define SOUND_HDA_OSD0                0xA0
-#define SOUND_HDA_OSD0CTL             SOUND_HDA_OSD0 + 0x00 // Output Stream Descriptor Control
-#define SOUND_HDA_OSD0STS             SOUND_HDA_OSD0 + 0x03 // Output Stream Descriptor Status
-#define SOUND_HDA_OSD0LPIB            SOUND_HDA_OSD0 + 0x04 // Output Stream Descriptor Link Position in Buffer
-#define SOUND_HDA_OSD0CBL             SOUND_HDA_OSD0 + 0x08 // Output Stream Descriptor Cyclic Buffer Length
-#define SOUND_HDA_OSD0LVI             SOUND_HDA_OSD0 + 0x0C // Output Stream Descriptor Last Valid Index
-#define SOUND_HDA_OSD0FIFOS           SOUND_HDA_OSD0 + 0x10 // Output Stream Descriptor FIFO Size
-#define SOUND_HDA_OSD0FMT             SOUND_HDA_OSD0 + 0x12 // Output Stream Descriptor Format
-#define SOUND_HDA_OSD0BDPL            SOUND_HDA_OSD0 + 0x18 // Output Stream Descriptor BDL Pointer Lower Base Address
-#define SOUND_HDA_OSD0BDPU            SOUND_HDA_OSD0 + 0x1C // Output Stream Descriptor BDL Pointer Upper Base Address
+// Stream descriptor blocks (HDA spec §3.3.34, page 27): identical 0x20-byte
+// register layout for every input, output, and bidirectional descriptor.
+// Per-register offsets aren't enumerated here — the SD register table near
+// the end of the typedef block is the single source of truth, and the
+// MMIO dispatch resolves (offset → stream index, sub-offset → register)
+// automatically.
+//
+// Today: NO_IN=1 → ISD0 at 0x80; NO_OUT=1 → OSD0 at 0xA0; NO_BSS=0.
 
 #define SOUND_HDA_PARAM_V             0x103 // Version 1.03
 #define SOUND_HDA_PARAM_NO_OUT        0x01  // Number of output streams supported
@@ -124,12 +113,12 @@ PUSH_OPTIMIZATION_SIZE
 #define VERB_GET_AMP_GAIN_MUTE_LEFT                      0x2000
 
 #define VERB_SET_AMP_GAIN_MUTE                           0x3
-#define VERB_SET_AMP_GAIN_MUTE_MUTE                      0x80
-#define VERB_SET_AMP_GAIN_MUTE_GAIN_MASK                 0x7
-#define VERB_SET_AMP_GAIN_MUTE_OUTPUT                    0x8000
-#define VERB_SET_AMP_GAIN_MUTE_INPUT                     0x4000
-#define VERB_SET_AMP_GAIN_MUTE_LEFT                      0x2000
-#define VERB_SET_AMP_GAIN_MUTE_RIGHT                     0x1000
+#define VERB_SET_AMP_GAIN_MUTE_MUTE                      0x80   // Payload bit 7
+#define VERB_SET_AMP_GAIN_MUTE_GAIN_MASK                 0x7F   // Payload bits 6:0
+#define VERB_SET_AMP_GAIN_MUTE_OUTPUT                    0x8000 // Bit 15: Set Output Amp
+#define VERB_SET_AMP_GAIN_MUTE_INPUT                     0x4000 // Bit 14: Set Input Amp
+#define VERB_SET_AMP_GAIN_MUTE_LEFT                      0x2000 // Bit 13: Set Left  (channel 0)
+#define VERB_SET_AMP_GAIN_MUTE_RIGHT                     0x1000 // Bit 12: Set Right (channel 1)
 
 #define VERB_GET_CONV_FMT                                0xA
 #define VERB_SET_CONV_FMT                                0x2
@@ -308,13 +297,128 @@ enum {
 // HDA_RATE_TABLE (otherwise expands to an undeclared identifier).
 #define HDA_RATE_BIT(hz)         (1u << HDA_RATE_BIT_POS_##hz)
 
-// Sample-size advertisement bits in SUPP_PCM_SIZE_RATES (HDA spec
-// 7.3.4.1, parameter 0x0A bits 16..20).
-#define HDA_PCM_SIZE_8           (1u << 16)
-#define HDA_PCM_SIZE_16          (1u << 17)
-#define HDA_PCM_SIZE_20          (1u << 18)
-#define HDA_PCM_SIZE_24          (1u << 19)
-#define HDA_PCM_SIZE_32          (1u << 20)
+// HDA bit-depth table. Single source of truth for both the SDnFMT BITS
+// field (spec 3.3.41 / 3.7.1, bits 6:4) and the matching advertisement
+// bits in CODEC_PARAM_SUPP_PCM_SIZE_RATES (spec 7.3.4.7, bits 16..20).
+//
+// Container size is *not* ceil(bits/8): the spec mandates 32-bit
+// containers (4 bytes) for both 20-bit and 24-bit samples. Encoding the
+// container size in the same table the worker reads is the whole point —
+// the previous nested ternary in the worker derived bytes_per_sample
+// from the bit count and got 20/24-bit wrong by 1 byte (33% pacing
+// error), masked only because the codec advertised 16-bit only.
+//
+// X(bits, code, container_bytes, advert_bit):
+//   bits            — sample width, used only for naming
+//   code            — value of SDnFMT BITS field (0..4); 5..7 reserved
+//   container_bytes — bytes per sample in memory (1, 2, or 4)
+//   advert_bit      — bit position in SUPP_PCM_SIZE_RATES (16..20)
+#define HDA_BITS_TABLE(X)        \
+    X( 8, 0, 1, 16)              \
+    X(16, 1, 2, 17)              \
+    X(20, 2, 4, 18)              \
+    X(24, 3, 4, 19)              \
+    X(32, 4, 4, 20)
+
+// Advertisement-bit constants HDA_PCM_SIZE_8..HDA_PCM_SIZE_32 generated
+// from the bit-depth table; OR them into a SUPP_PCM_SIZE_RATES response.
+enum {
+#define HDA_PCM_SIZE_ENUM(bits, code, bytes, ad) HDA_PCM_SIZE_##bits = (1u << (ad)),
+    HDA_BITS_TABLE(HDA_PCM_SIZE_ENUM)
+#undef HDA_PCM_SIZE_ENUM
+};
+
+// Container size in bytes indexed by SDnFMT BITS field (0..7). Reserved
+// codes 5..7 default-init to 0; callers treat 0 as an invalid format and
+// bail (see sound_hda_stream_drain).
+static const uint8_t hda_fmt_container_bytes[8] = {
+#define HDA_BITS_BYTES_INIT(bits, code, bytes, ad) [code] = (bytes),
+    HDA_BITS_TABLE(HDA_BITS_BYTES_INIT)
+#undef HDA_BITS_BYTES_INIT
+};
+
+// Output amp caps: chosen to give a 16 dB range with 0.5 dB resolution,
+// matching what consumer HDA codecs (Realtek ALC1220, IDT 92HD83, etc.)
+// typically advertise. The wider 74 dB range we used to advertise made
+// amixer's linear percent display feel useless because most of the
+// slider sat in perceptually-inaudible territory.
+//
+//   STEPSIZE encoded value: actual_step_dB = (encoded + 1) * 0.25
+//                           → encoded 1 = 0.5 dB per step
+//   NUMSTEPS encoded value: maximum gain step value (0..NumSteps incl.)
+//                           → 32 → 33 step values, range = 32 * 0.5 = 16 dB
+//   OFFSET   encoded value: gain step that produces 0 dB
+//                           → 32 → step 32 = 0 dB, step 0 = -16 dB
+// Bit packing happens in the CODEC_PARAM_OUTPUT_AMP_CAPS_* macros below;
+// these symbolic forms are kept up here so hda_gain_to_q15 and the
+// amp-reset defaults can reference them by name.
+#define HDA_AMP_NUMSTEPS         32
+#define HDA_AMP_OFFSET           32
+#define HDA_AMP_STEPSIZE_ENC      1   // → 0.5 dB per step
+
+// HDA gain step → Q15 amplitude factor. Reads HDA_AMP_OFFSET and
+// HDA_AMP_STEPSIZE_ENC so changing the advertised amp caps doesn't
+// break the conversion math.
+//
+// Convert without libm: each 6 dB ≈ ÷2, so the factor decomposes into
+// `shift` halvings plus a 12-entry half-dB mantissa for the 0..5.5 dB
+// residue. Accuracy is within ~0.1 dB of `pow(10, -atten/20)` — well
+// below the perceptual threshold (~1 dB) — and fixed-point so it works
+// whether USE_FPU is enabled or not.
+// Verified vs `round(pow(10, -dB/20) * 32768)`; max error ±0.0002 dB.
+static const uint16_t hda_gain_db_mantissa_half[12] = {
+    32768, // -0.0 dB → 1.000
+    30935, // -0.5 dB → 0.944
+    29205, // -1.0 dB → 0.891
+    27571, // -1.5 dB → 0.841
+    26029, // -2.0 dB → 0.794
+    24573, // -2.5 dB → 0.750
+    23198, // -3.0 dB → 0.708
+    21900, // -3.5 dB → 0.668
+    20675, // -4.0 dB → 0.631
+    19519, // -4.5 dB → 0.596
+    18427, // -5.0 dB → 0.562
+    17396, // -5.5 dB → 0.531
+};
+
+static int32_t hda_gain_to_q15(uint8_t gain, uint8_t mute)
+{
+    if (mute)                     return 0;
+    if (gain >= HDA_AMP_OFFSET)   return 32768;   // 0 dB or above (clamp)
+    // attenuation in quarter-dB units = (offset - gain) * step_quarter_db,
+    // where step_quarter_db = (encoded + 1).
+    int atten_qdb = ((int)HDA_AMP_OFFSET - (int)gain) * (HDA_AMP_STEPSIZE_ENC + 1);
+    int atten_hdb = atten_qdb / 2;        // half-dB units
+    int shift     = atten_hdb / 12;       // 6 dB = 12 half-dB ≈ ÷2
+    int rem       = atten_hdb % 12;
+    return (int32_t)hda_gain_db_mantissa_half[rem] >> shift;
+}
+
+// Sized MMIO load/store. Use these in every register handler instead of
+// bare read_uint{8,16,32}_le — they respect the access width the bus
+// reports, so 1-byte writes to a 4-byte register don't pull garbage from
+// the surrounding payload (which is uninitialised stack on the dispatch
+// path), and reads return only the bytes the guest asked for. Static
+// inline because they're 100% used inside this file; no point in
+// promoting to a shared header until a second device wants them.
+static inline uint32_t mmio_load(const void *data, uint8_t size)
+{
+    switch (size) {
+        case 1:  return read_uint8(data);
+        case 2:  return read_uint16_le(data);
+        case 4:  return read_uint32_le(data);
+        default: return 0;
+    }
+}
+
+static inline void mmio_store(void *data, uint8_t size, uint32_t val)
+{
+    switch (size) {
+        case 1: write_uint8(data, (uint8_t)val); break;
+        case 2: write_uint16_le(data, (uint16_t)val); break;
+        case 4: write_uint32_le(data, val); break;
+    }
+}
 
 #define CODEC_PARAM_SUPP_STREAM_FMTS                     0x0B
 #define CODEC_PARAM_SUPP_STREAM_FMTS_PCM                 (1 << 0)
@@ -340,9 +444,12 @@ enum {
 
 #define CODEC_PARAM_OUTPUT_AMP_CAPS                      0x12
 #define CODEC_PARAM_OUTPUT_AMP_CAPS_MUTE_CAP             (   1 << 31)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE             (   3 << 16)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS             (0x4a <<  8)
-#define CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET               (0x4a <<  0) // Why 0x4a?
+// Bit-packed forms of the amp caps for the GET_PARAMETER response.
+// The numeric constants live up at the top of the file (HDA_AMP_*) so
+// hda_gain_to_q15 and the reset paths can reference them by name.
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE             (HDA_AMP_STEPSIZE_ENC << 16)
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS             (HDA_AMP_NUMSTEPS     <<  8)
+#define CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET               (HDA_AMP_OFFSET       <<  0)
 
 #define CODEC_PARAM_CONN_LIST_LEN                        0x0E
 #define CODEC_PARAM_SUPP_POWER_STATES                    0x0F
@@ -350,15 +457,62 @@ enum {
 #define CODEC_PARAM_GPIO_CNT                             0x11
 #define CODEC_PARAM_VOLUME_KNOB                          0x12
 
+// Stream descriptor address layout (HDA spec §3.3 page 27):
+//   ISDn at 0x80 + n*0x20                   for n in [0, ISS)
+//   OSDn at 0x80 + (ISS + n)*0x20           for n in [0, OSS)
+//   BSDn at 0x80 + (ISS + OSS + n)*0x20     for n in [0, BSS)
+// Descriptor index — used as the SIE/SIS bit in INTCTL/INTSTS per
+// §3.3.14 — increases sequentially in that order.
+#define HDA_STREAM_BASE         0x80
+#define HDA_STREAM_STRIDE       0x20
+#define HDA_STREAMS_TOTAL       (SOUND_HDA_PARAM_NO_IN  \
+                               + SOUND_HDA_PARAM_NO_OUT \
+                               + SOUND_HDA_PARAM_NO_BSS)
+#define HDA_STREAM_REGION_END   (HDA_STREAM_BASE + HDA_STREAMS_TOTAL * HDA_STREAM_STRIDE)
+
+typedef enum {
+    HDA_STREAM_DIR_INPUT  = 0,
+    HDA_STREAM_DIR_OUTPUT = 1,
+    HDA_STREAM_DIR_BIDIR  = 2,
+} hda_stream_dir_t;
+
+// Forward decl so sound_hda_stream_t can keep a back-pointer for the
+// worker thread. Worker arg is a sound_hda_stream_t*; the dev pointer
+// rides along inside the stream so we don't need a heap-allocated
+// (dev, stream) tuple per stream.
+struct sound_hda_dev_s;
+typedef struct sound_hda_dev_s sound_hda_dev_t;
+
 typedef struct {
-    uint8_t     bdl_lvi;
+    sound_hda_dev_t *hda;      // Back-ref to owning dev — set at init,
+                               // never reseated. Lets the worker find
+                               // pci_func / lock from a stream pointer.
+    uint8_t     index;         // Descriptor index (0..HDA_STREAMS_TOTAL-1).
+                               // Equals the SIE/SIS bit position per spec
+                               // §3.3.14 — caches it as intsts_bit for the
+                               // hot IRQ path even though they're identical.
+    uint8_t     intsts_bit;
+    uint8_t     dir;           // hda_stream_dir_t
+    uint32_t    bdl_lvi;       // Spec stores 8 bits; widened to 32 here so
+                               // the storage-register dispatch can pass a
+                               // single offsetof()/sizeof() pair.
     uint32_t    bdl_lo;
     uint32_t    bdl_hi;
     uint32_t    bdl_len;
     uint32_t    lpib;
     uint8_t     ioce;
-    uint8_t     srst;          // SDnCTL bit 0: stream reset (mirrors guest write)
-    uint8_t     stream;
+    uint8_t     feie;          // SDnCTL bit 3 — stored for RMW round-trip
+    uint8_t     deie;          // SDnCTL bit 4 — stored for RMW round-trip
+    uint8_t     srst;          // SDnCTL bit 0 — mirrored for the SRST 0→1 edge
+    uint8_t     stripe;        // SDnCTL bits 17:16 — stored for round-trip
+    uint8_t     tp;            // SDnCTL bit 18 — stored for round-trip
+    uint8_t     ctl_strm;      // SDnCTL bits 23:20 — stream tag set by guest
+                               // driver. Mirrors the codec-side `stream` field
+                               // below (verb VERB_SET_CONV_STREAM_CHAN); the
+                               // two are required to match per spec §7.3.3.8
+                               // and the codec uses the verb-side one.
+    uint8_t     stream;        // Codec-side stream tag from
+                               // VERB_SET_CONV_STREAM_CHAN.
     uint8_t     channel;
     uint32_t    running;       // Guest intent: 1 = stream should be running
     uint32_t    worker_alive;  // Worker lifetime: 1 = worker thread exists
@@ -374,18 +528,34 @@ typedef struct {
     uint8_t     right_gain;
     uint8_t     left_mute;
     uint8_t     right_mute;
+    int32_t     gain_q15;      // Cached amplitude factor for the worker.
+                               // Q15 fixed point: 32768 = unity (0 dB),
+                               // 0 = full mute. Recomputed in
+                               // VERB_SET_AMP_GAIN_MUTE; default unity
+                               // (codec power-on per HDA spec §7.3.3.7
+                               // is "Gain field defaults to Offset" =
+                               // 0 dB). Worker reads lockless — torn
+                               // 32-bit reads are aligned/atomic on
+                               // x86/arm64 and a stale value across one
+                               // chunk is inaudible.
 } sound_hda_stream_t;
 
-typedef struct {
+struct sound_hda_dev_s {
     pci_func_t* pci_func;
     spinlock_t  lock;
     uint32_t    gctl;
+    uint16_t    wakeen;        // §3.3.8  — preserved across CRST
+    uint16_t    statests;      // §3.3.9  — codec presence; bit 0 = our codec
+    uint16_t    gsts;          // §3.3.10 — flush status (we don't model flush)
+    uint32_t    ssync;         // §3.3.17 — stream sync, round-trip only
     uint32_t    intr_ctrl;
     uint32_t    corb_lo;
     uint32_t    corb_hi;
     uint16_t    corb_rp;
     uint16_t    corb_wp;
     uint32_t    corb_size;
+    uint8_t     corbctl;       // §3.3.22 — CORBRUN/CMEIE; round-trip only
+    uint8_t     corbsts;       // §3.3.23 — CORB error status; never set by us
     uint32_t    rirb_lo;
     uint32_t    rirb_hi;
     uint32_t    rirb_rp;
@@ -393,11 +563,559 @@ typedef struct {
     uint32_t    rirb_size;
     uint32_t    rirb_cnt;
     uint32_t    rirb_status;
+    uint8_t     rirbctl;       // §3.3.29 — RIRBDMAEN/RINTCTL; round-trip only
+    uint32_t    dplbase;       // §3.3.32 — DMA Position Buffer base low
+    uint32_t    dpubase;       // §3.3.33 — DMA Position Buffer base high
+    uint32_t    icw;           // §3.4.1  — Immediate Command Output
+    uint32_t    irr;           // §3.4.2  — Immediate Response Input
+    uint16_t    ics;           // §3.4.3  — Immediate Command Status
     uint32_t    power_state;
+    // Beep Generator widget (NID 4, §7.2.3.8 / §7.3.3.31). Independent
+    // of stream playback — beep tone runs whenever beep_divider != 0,
+    // regardless of whether any stream descriptor is RUN. Worker
+    // lifecycle parallels the per-stream worker: spawn on first non-zero
+    // SET_BEEP_GENERATION via CAS on beep_worker_alive, the worker
+    // exits when it sees beep_running=0.
+    uint8_t     beep_divider;  // §7.3.3.31 payload — 0 = off, N = 48000/(4N) Hz
+    uint8_t     beep_mute;
+    uint8_t     beep_gain;
+    uint32_t    beep_running;  // guest intent: 1 = generate tone
+    uint32_t    beep_worker_alive;
+    uint8_t     pin_ctrl;      // NID 3 pin widget control byte (§7.3.3.13).
+                               // Bit 6 OUT_ENABLE, 5 IN_ENABLE, 7 HPHN, 0 VREF.
+                               // Default = OUT_ENABLE so probe-time GET returns
+                               // the same value the previous hardcoded handler
+                               // did. Multi-pin codecs would extend this to a
+                               // per-NID array.
 
-    sound_hda_stream_t stream_output;
-    sound_subsystem_t subsystem;
-} sound_hda_dev_t;
+    sound_hda_stream_t streams[HDA_STREAMS_TOTAL];
+    sound_subsystem_t  subsystem;
+};
+
+// Convenience accessor for the (currently single) output stream. The codec
+// verbs route there directly; the MMIO dispatch addresses streams by
+// descriptor index and doesn't need it.
+#define HDA_OUTPUT_STREAM_INDEX  SOUND_HDA_PARAM_NO_IN
+static inline sound_hda_stream_t *hda_output_stream(sound_hda_dev_t *hda) {
+    return &hda->streams[HDA_OUTPUT_STREAM_INDEX];
+}
+
+// Forward decl — SDnCTL action body lives further down with the rest of
+// the worker / start-stop machinery.
+static void sound_hda_stream_ctl_action(sound_hda_dev_t *hda,
+                                        sound_hda_stream_t *stream,
+                                        uint32_t value);
+
+// === Stream descriptor register dispatch ===
+//
+// All input, output, and bidirectional stream descriptors share the same
+// 0x20-byte register layout (HDA spec §3.3.34). One table services every
+// stream — adding ISD0 / multi-stream means changing HDA_STREAMS_TOTAL,
+// not the table.
+//
+// Registers are categorised by `kind`:
+//   SD_REG_RW_FIELD — read returns the stored field, writes store into it
+//   SD_REG_RO_FIELD — read returns the stored field, writes ignored
+//   SD_REG_RO_FN    — read calls a compute callback, writes ignored
+//   SD_REG_ACTION   — both directions go through callbacks (used for
+//                     SDnCTL where bits compose from multiple fields and
+//                     the write must spawn / signal the worker, and for
+//                     SDnSTS where reads compute FIFORDY and writes are
+//                     RW1C against `status`).
+typedef enum {
+    SD_REG_RW_FIELD = 0,
+    SD_REG_RO_FIELD,
+    SD_REG_RO_FN,
+    SD_REG_ACTION,
+} sd_reg_kind_t;
+
+typedef uint32_t (*sd_reg_read_fn) (sound_hda_dev_t*, sound_hda_stream_t*);
+typedef void     (*sd_reg_write_fn)(sound_hda_dev_t*, sound_hda_stream_t*, uint32_t);
+
+typedef struct {
+    uint16_t        sub_off;     // offset within the 0x20 stream block
+    uint8_t         width;       // canonical register width (1, 2, or 4)
+    sd_reg_kind_t   kind;
+    uint16_t        field_off;   // offsetof(sound_hda_stream_t, field)
+    uint8_t         field_size;  // sizeof(field) — 1, 2, or 4
+    sd_reg_read_fn  read_fn;     // ACTION / RO_FN
+    sd_reg_write_fn write_fn;    // ACTION
+    const char     *name;        // diagnostics; matches the spec mnemonic
+} sd_reg_t;
+
+// Read/write a struct field at (offset, size) as a little-endian
+// unsigned integer of the requested width. Used by both the SD register
+// table (base = sound_hda_stream_t*) and the global controller register
+// table (base = sound_hda_dev_t*) — same shape of operation, different
+// host struct, so the helper is generic over the base pointer.
+static uint32_t reg_field_load(void *base, uint16_t off, uint8_t sz)
+{
+    uint8_t *p = (uint8_t*)base + off;
+    switch (sz) {
+        case 1:  return *(uint8_t  *)p;
+        case 2:  return *(uint16_t *)p;
+        case 4:  return *(uint32_t *)p;
+        default: return 0;
+    }
+}
+
+static void reg_field_store(void *base, uint16_t off, uint8_t sz, uint32_t v)
+{
+    uint8_t *p = (uint8_t*)base + off;
+    switch (sz) {
+        case 1: *(uint8_t  *)p = (uint8_t)v;  break;
+        case 2: *(uint16_t *)p = (uint16_t)v; break;
+        case 4: *(uint32_t *)p = v;           break;
+    }
+}
+
+// SDnCTL (HDA spec §3.3.35): 24-bit register; bits 0 SRST, 1 RUN, 2
+// IOCE, 3 FEIE, 4 DEIE, 17:16 STRIPE, 18 TP, 19 DIR (RO 0 unless bidir),
+// 23:20 STRM (stream tag). Composed on read; write defers to the
+// action body further down (worker spawn, SRST edge, etc.).
+static uint32_t sd_ctl_read(sound_hda_dev_t *hda, sound_hda_stream_t *s)
+{
+    (void)hda;
+    uint32_t v = 0;
+    v |= (s->srst       & 1u) << 0;
+    v |= (atomic_load_uint32_relax(&s->running) ? 1u : 0u) << 1;
+    v |= (s->ioce       & 1u) << 2;
+    v |= (s->feie       & 1u) << 3;
+    v |= (s->deie       & 1u) << 4;
+    v |= ((uint32_t)s->stripe  & 0x3u) << 16;
+    v |= (s->tp         & 1u) << 18;
+    v |= (s->dir == HDA_STREAM_DIR_BIDIR ? 1u : 0u) << 19;
+    v |= ((uint32_t)s->ctl_strm & 0xFu) << 20;
+    return v;
+}
+
+static void sd_ctl_write(sound_hda_dev_t *hda, sound_hda_stream_t *s, uint32_t v)
+{
+    sound_hda_stream_ctl_action(hda, s, v);
+}
+
+// SDnSTS (HDA spec §3.3.36): bits 2 BCIS, 3 FIFOE, 4 DESE are RW1C
+// against `status`; bit 5 FIFORDY is computed RO. The worker latches
+// BCIS into `status` under hda->lock; reads return it as-is.
+static uint32_t sd_sts_read(sound_hda_dev_t *hda, sound_hda_stream_t *s)
+{
+    (void)hda;
+    uint32_t v = s->status & 0x1Cu;
+    if (s->lpib < s->bdl_len) v |= (1u << 5);
+    return v;
+}
+
+static void sd_sts_write(sound_hda_dev_t *hda, sound_hda_stream_t *s, uint32_t v)
+{
+    (void)hda;
+    s->status &= ~(uint8_t)(v & 0x1Cu);
+}
+
+// SDnFIFOS (HDA spec §3.3.40): max FIFO depth in bytes. Reset value is
+// implementation-specific; we report a constant for both directions.
+static uint32_t sd_fifos_read(sound_hda_dev_t *hda, sound_hda_stream_t *s)
+{
+    (void)hda; (void)s;
+    return SOUND_HDA_FIFO_SIZE;
+}
+
+#define SD_FIELD_OFF(field)   offsetof(sound_hda_stream_t, field)
+#define SD_FIELD_SIZE(field)  sizeof(((sound_hda_stream_t*)0)->field)
+#define SD_RW(off, w, field) \
+    { (off), (w), SD_REG_RW_FIELD, SD_FIELD_OFF(field), SD_FIELD_SIZE(field), NULL, NULL, #field }
+#define SD_RO(off, w, field) \
+    { (off), (w), SD_REG_RO_FIELD, SD_FIELD_OFF(field), SD_FIELD_SIZE(field), NULL, NULL, #field }
+
+// Stream descriptor register table (§3.3.35–§3.3.43). Adding a new
+// register or wiring a missing one is a one-row change; the dispatch
+// below has no per-register knowledge.
+static const sd_reg_t sd_regs[] = {
+    { 0x00, 4, SD_REG_ACTION, 0, 0, sd_ctl_read,   sd_ctl_write,  "SDnCTL"   },
+    { 0x03, 1, SD_REG_ACTION, 0, 0, sd_sts_read,   sd_sts_write,  "SDnSTS"   },
+    SD_RO(0x04, 4, lpib),       // SDnLPIB — RO; worker advances this
+    SD_RW(0x08, 4, bdl_len),    // SDnCBL  — Cyclic Buffer Length
+    SD_RW(0x0C, 2, bdl_lvi),    // SDnLVI  — Last Valid Index
+    { 0x10, 2, SD_REG_RO_FN,  0, 0, sd_fifos_read, NULL,          "SDnFIFOS" },
+    SD_RW(0x12, 2, fmt),        // SDnFMT  — decoded by stream worker
+    SD_RW(0x18, 4, bdl_lo),     // SDnBDPL — BDL pointer low (128-B aligned)
+    SD_RW(0x1C, 4, bdl_hi),     // SDnBDPU — BDL pointer high (RO 0 if !64-bit)
+};
+
+#undef SD_RW
+#undef SD_RO
+#undef SD_FIELD_OFF
+#undef SD_FIELD_SIZE
+
+static const sd_reg_t *sd_reg_lookup(uint16_t sub_off)
+{
+    for (size_t i = 0; i < sizeof(sd_regs) / sizeof(sd_regs[0]); ++i) {
+        if (sd_regs[i].sub_off == sub_off) return &sd_regs[i];
+    }
+    return NULL;
+}
+
+static bool sd_dispatch_read(sound_hda_dev_t *hda, sound_hda_stream_t *s,
+                             uint16_t sub_off, void *data, uint8_t size)
+{
+    const sd_reg_t *r = sd_reg_lookup(sub_off);
+    if (r == NULL) return false;
+    uint32_t v = 0;
+    switch (r->kind) {
+        case SD_REG_RW_FIELD:
+        case SD_REG_RO_FIELD:
+            v = reg_field_load(s, r->field_off, r->field_size);
+            break;
+        case SD_REG_RO_FN:
+        case SD_REG_ACTION:
+            v = r->read_fn(hda, s);
+            break;
+    }
+    mmio_store(data, size, v);
+    return true;
+}
+
+static bool sd_dispatch_write(sound_hda_dev_t *hda, sound_hda_stream_t *s,
+                              uint16_t sub_off, const void *data, uint8_t size)
+{
+    const sd_reg_t *r = sd_reg_lookup(sub_off);
+    if (r == NULL) return false;
+    uint32_t v = mmio_load(data, size);
+    switch (r->kind) {
+        case SD_REG_RW_FIELD:
+            reg_field_store(s, r->field_off, r->field_size, v);
+            break;
+        case SD_REG_RO_FIELD:
+        case SD_REG_RO_FN:
+            // Read-only — writes ignored (no error per §3.1.2).
+            break;
+        case SD_REG_ACTION:
+            r->write_fn(hda, s, v);
+            break;
+    }
+    return true;
+}
+
+// === Global controller register dispatch ===
+//
+// Same pattern as sd_regs[] above, applied to the controller's global
+// register block at offsets 0x00-0x7F (HDA spec §3.3.1-§3.3.31) plus
+// the §3.4 immediate command interface and the §3.3.44 wall-clock
+// alias. Adding a missing register is a one-row change; the dispatch
+// has no per-register knowledge.
+typedef enum {
+    GR_REG_RW_FIELD = 0,
+    GR_REG_RO_FIELD,
+    GR_REG_RO_FN,
+    GR_REG_RO_CONST,
+    GR_REG_ACTION,
+} gr_reg_kind_t;
+
+typedef uint32_t (*gr_reg_read_fn) (sound_hda_dev_t*);
+typedef void     (*gr_reg_write_fn)(sound_hda_dev_t*, uint32_t);
+
+typedef struct {
+    uint16_t        off;
+    uint8_t         width;
+    gr_reg_kind_t   kind;
+    uint16_t        field_off;     // offsetof(sound_hda_dev_t, field)
+    uint8_t         field_size;
+    uint32_t        const_val;     // RO_CONST
+    gr_reg_read_fn  read_fn;       // RO_FN / ACTION
+    gr_reg_write_fn write_fn;      // ACTION
+    const char     *name;
+} gr_reg_t;
+
+// Forward decls — bodies live below to keep table-construction tight.
+static uint32_t sound_hda_compute_intsts(sound_hda_dev_t *hda);
+static uint32_t sound_hda_wallclk(void);
+static void     sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v);
+static void     sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd);
+static void     sound_hda_controller_reset(sound_hda_dev_t *hda);
+static void     sound_hda_beep_set(sound_hda_dev_t *hda, uint8_t divider);
+
+// === Global register callbacks ===
+static uint32_t gr_gctl_read(sound_hda_dev_t *hda)
+{
+    // GCTL bit 8 UNSOL is force-on: we accept unsolicited responses
+    // unconditionally (no source generates them today, but the bit
+    // advertises the capability). Bit 0 CRST round-trips honestly.
+    return hda->gctl | (1u << 8);
+}
+
+static void gr_gctl_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // CRST 1→0: enter reset (halt streams + zero ring/state).
+    // CRST 0→1: exit reset; re-set STATESTS bit 0 because the codec
+    //           re-asserts presence on link out-of-reset (§3.3.9).
+    uint32_t prev = hda->gctl;
+    hda->gctl = v;
+    if ((prev & 1u) && !(v & 1u)) {
+        sound_hda_controller_reset(hda);
+    } else if (!(prev & 1u) && (v & 1u)) {
+        hda->statests |= 0x0001u;   // codec on SDIN[0]
+    }
+    // FCNTRL 0→1 (bit 1): DMA position buffer flush request (§3.3.7).
+    // Spec: "The flush is complete when Flush Status is set." We have
+    // no real DMA pipeline to flush, so complete the handshake
+    // immediately by setting GSTS.FSTS — without this a guest that
+    // does the flush dance (e.g. before suspend) would hang polling.
+    if (!(prev & 0x2u) && (v & 0x2u)) {
+        hda->gsts |= 0x2u;          // FSTS
+    }
+}
+
+static uint32_t gr_intsts_read(sound_hda_dev_t *hda)  { return sound_hda_compute_intsts(hda); }
+static uint32_t gr_wallclk_read(sound_hda_dev_t *hda) { (void)hda; return sound_hda_wallclk(); }
+
+static void gr_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    sound_hda_corb_wp_write(hda, v);
+}
+
+static void gr_corb_rp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.21: bit 15 self-clears RP. Spec also requires CORBCTL.CORBRUN
+    // to be 0 before resetting RP — "or else DMA transfer may be
+    // corrupted." Our CORB consumer runs synchronously under hda->lock
+    // so there's no real corruption window, but a guest that violates
+    // this (writes RP reset while CORBRUN=1) is bug-checking against
+    // spec-conformant hardware, so silently ignore the reset to match.
+    if (v & 0x8000u) {
+        if (hda->corbctl & 0x2u) {
+            DO_ONCE(rvvm_debug("sound-hda: CORB_RP reset requested with"
+                               " CORBRUN=1; ignored per §3.3.21"));
+            return;
+        }
+        hda->corb_rp = 0;
+    } else {
+        hda->corb_rp = v & 0x7Fu;
+    }
+}
+
+static const uint32_t hda_corb_sizes[4] = { 8,  64, 1024, 0 };
+static const uint32_t hda_rirb_sizes[4] = { 16, 128, 2048, 0 };
+
+static uint32_t gr_corb_size_read(sound_hda_dev_t *hda)
+{
+    (void)hda;
+    return (SOUND_HDA_PARAM_CORBSZCAP << 4) | SOUND_HDA_PARAM_CORBSIZE;
+}
+
+static void gr_corb_size_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    uint32_t sz = hda_corb_sizes[v & 0x3u];
+    if (sz) hda->corb_size = sz;
+}
+
+static uint32_t gr_rirb_size_read(sound_hda_dev_t *hda)
+{
+    (void)hda;
+    return (SOUND_HDA_PARAM_RIRBSZCAP << 4) | SOUND_HDA_PARAM_RIRBSIZE;
+}
+
+static void gr_rirb_size_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    uint32_t sz = hda_rirb_sizes[v & 0x3u];
+    if (sz) hda->rirb_size = sz;
+}
+
+static void gr_rirb_wp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    hda->rirb_wp = (v & 0x8000u) ? 0u : (v & 0xFFu);
+}
+
+static void gr_rirb_status_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    hda->rirb_status &= ~(v & 0x3u);   // RW1C against bits 0/1
+}
+
+static void gr_statests_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.9: RW1CS — writing 1 clears the corresponding bit. Bits are
+    // sticky (only cleared by power-on reset or RW1C), preserved across
+    // CRST. Clear masked bits in stored value.
+    hda->statests &= ~(v & 0x7FFFu);
+}
+
+static void gr_gsts_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.10: only bit 1 FSTS is RW1C. We don't model flush.
+    hda->gsts &= ~(v & 0x2u);
+}
+
+static void gr_corbsts_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    // §3.3.23: bit 0 CMEI is RW1C. We never raise CORB memory errors.
+    hda->corbsts &= ~(v & 0x1u);
+}
+
+// §3.4.1: "Software must ensure that the ICB bit in the Immediate
+// Command Status register is clear before writing a value into [ICW]
+// or undefined behavior will result." Our model dispatches synchronously
+// under hda->lock so the bad state is unreachable in practice — but a
+// guest that violates this is bug-checking against compliant hardware,
+// so we log it as a diagnostic and accept the write anyway (matches the
+// "may produce undefined results" wording: a deterministic outcome
+// either way is fine).
+static void gr_icw_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    if (hda->ics & 0x1u) {
+        DO_ONCE(rvvm_debug("sound-hda: ICW written with ICS.ICB=1; "
+                           "spec §3.4.1 prohibits this"));
+    }
+    hda->icw = v;
+}
+
+// §3.4 Immediate Command Interface — PIO-style alternative to CORB/RIRB.
+// Writing ICS bit 0 (ICB=1) dispatches the value in ICW as a codec verb,
+// latches the response in IRR, sets ICS bit 1 (IRV), clears ICB.
+static void gr_ics_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    if (v & 0x1u) {
+        // ICB=1 → dispatch the queued verb. Mirror the CORB path: the
+        // codec_cmd function writes to RIRB and raises the IRQ; we
+        // additionally latch the response in IRR for the PIO path.
+        // codec_cmd's RIRB write side-effect is harmless if guest is
+        // using PIO exclusively (RIRB ring may be unallocated; the
+        // pci_get_dma_ptr inside sound_hda_write_rirb returns NULL and
+        // the function exits cleanly).
+        //
+        // Use a tiny shim: capture the response by intercepting the
+        // RIRB write, OR just dispatch through the same verb-decoder
+        // path. Simplest: inline a minimal version.
+        sound_hda_codec_cmd(hda, hda->icw);
+        // Response was written into RIRB at hda->rirb_wp. Read it back
+        // for IRR. (rirb_lo+rirb_wp*8 holds the response dword.)
+        if (hda->rirb_lo) {
+            uint32_t *resp = pci_get_dma_ptr(hda->pci_func,
+                (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8, 4);
+            if (resp) hda->irr = *resp;
+        }
+        hda->ics = (hda->ics & ~0x1u) | 0x2u;   // clear ICB, set IRV
+    }
+    if (v & 0x2u) {
+        hda->ics &= ~0x2u;                       // RW1C clears IRV
+    }
+}
+
+#define GR_FIELD_OFF(field)   offsetof(sound_hda_dev_t, field)
+#define GR_FIELD_SIZE(field)  sizeof(((sound_hda_dev_t*)0)->field)
+#define GR_RW(off, w, field) \
+    { (off), (w), GR_REG_RW_FIELD, GR_FIELD_OFF(field), GR_FIELD_SIZE(field), 0, NULL, NULL, #field }
+#define GR_RO(off, w, field) \
+    { (off), (w), GR_REG_RO_FIELD, GR_FIELD_OFF(field), GR_FIELD_SIZE(field), 0, NULL, NULL, #field }
+#define GR_RO_CONST(off, w, val, name_str) \
+    { (off), (w), GR_REG_RO_CONST, 0, 0, (val), NULL, NULL, name_str }
+#define GR_ACTION(off, w, fname, rfn, wfn, name_str) \
+    { (off), (w), GR_REG_ACTION, GR_FIELD_OFF(fname), GR_FIELD_SIZE(fname), 0, (rfn), (wfn), name_str }
+#define GR_RO_FN(off, w, rfn, name_str) \
+    { (off), (w), GR_REG_RO_FN, 0, 0, 0, (rfn), NULL, name_str }
+
+// Global controller register table.
+static const gr_reg_t gr_regs[] = {
+    GR_RO_CONST(SOUND_HDA_GCAP,         2, SOUND_HDA_PARAM_GCAP,                     "GCAP"      ),
+    GR_RO_CONST(SOUND_HDA_VS,           2, SOUND_HDA_PARAM_V,                        "VS"        ),
+    GR_RO_CONST(SOUND_HDA_OUTPAY,       2, 0x3C,                                     "OUTPAY"    ),
+    GR_RO_CONST(SOUND_HDA_INPAY,        2, 0x1D,                                     "INPAY"     ),
+    GR_ACTION(SOUND_HDA_GLOBAL_CTRL,    4, gctl,     gr_gctl_read,    gr_gctl_write, "GCTL"      ),
+    GR_RW(SOUND_HDA_WAKEEN,             2, wakeen),
+    GR_ACTION(SOUND_HDA_STATESTS,       2, statests, NULL, gr_statests_write,        "STATESTS"  ),
+    GR_ACTION(SOUND_HDA_GSTS,           2, gsts,     NULL, gr_gsts_write,            "GSTS"      ),
+    // OUTSTRMPAY/INSTRMPAY: 0x00 = "no limit beyond OUT/INPAY". Spec
+    // §3.3.11/12 — most controllers report 0 here.
+    GR_RO_CONST(SOUND_HDA_OUTSTRMPAY,   2, 0x0000,                                   "OUTSTRMPAY"),
+    GR_RO_CONST(SOUND_HDA_INSTRMPAY,    2, 0x0000,                                   "INSTRMPAY" ),
+    GR_RW(SOUND_HDA_INTR_CTRL,          4, intr_ctrl),
+    GR_RO_FN(SOUND_HDA_INTSTS,          4, gr_intsts_read,                           "INTSTS"    ),
+    GR_RO_FN(SOUND_HDA_WALL_CLOCK,      4, gr_wallclk_read,                          "WALLCLK"   ),
+    GR_RW(SOUND_HDA_STREAM_SYNC,        4, ssync),
+    GR_RW(SOUND_HDA_CORB_LO,            4, corb_lo),
+    GR_RW(SOUND_HDA_CORB_HI,            4, corb_hi),
+    GR_ACTION(SOUND_HDA_CORB_WP,        2, corb_wp,  NULL, gr_corb_wp_write,         "CORBWP"    ),
+    GR_ACTION(SOUND_HDA_CORB_RP,        2, corb_rp,  NULL, gr_corb_rp_write,         "CORBRP"    ),
+    GR_RW(SOUND_HDA_CORB_CTRL,          1, corbctl),
+    GR_ACTION(SOUND_HDA_CORB_STATUS,    1, corbsts,  NULL, gr_corbsts_write,         "CORBSTS"   ),
+    GR_ACTION(SOUND_HDA_CORB_SIZE,      1, corb_size, gr_corb_size_read, gr_corb_size_write, "CORBSIZE"),
+    GR_RW(SOUND_HDA_RIRB_LO,            4, rirb_lo),
+    GR_RW(SOUND_HDA_RIRB_HI,            4, rirb_hi),
+    GR_ACTION(SOUND_HDA_RIRB_WP,        2, rirb_wp,  NULL, gr_rirb_wp_write,         "RIRBWP"    ),
+    GR_RW(SOUND_HDA_RIRB_INTR_CNT,      2, rirb_cnt),
+    GR_RW(SOUND_HDA_RIRB_CTRL,          1, rirbctl),
+    GR_ACTION(SOUND_HDA_RIRB_STATUS,    1, rirb_status, NULL, gr_rirb_status_write,  "RIRBSTS"   ),
+    GR_ACTION(SOUND_HDA_RIRB_SIZE,      1, rirb_size, gr_rirb_size_read, gr_rirb_size_write, "RIRBSIZE"),
+    GR_ACTION(SOUND_HDA_ICW,            4, icw,      NULL, gr_icw_write,             "ICW"       ),
+    GR_RW(SOUND_HDA_IRR,                4, irr),
+    GR_ACTION(SOUND_HDA_ICS,            2, ics,      NULL, gr_ics_write,             "ICS"       ),
+    GR_RW(SOUND_HDA_DMA_LO,             4, dplbase),
+    GR_RW(SOUND_HDA_DMA_HI,             4, dpubase),
+    GR_RO_FN(SOUND_HDA_WALCLKA,         4, gr_wallclk_read,                          "WALCLKA"   ),
+};
+
+#undef GR_RW
+#undef GR_RO
+#undef GR_RO_CONST
+#undef GR_ACTION
+#undef GR_RO_FN
+#undef GR_FIELD_OFF
+#undef GR_FIELD_SIZE
+
+static const gr_reg_t *gr_reg_lookup(uint16_t off)
+{
+    for (size_t i = 0; i < sizeof(gr_regs) / sizeof(gr_regs[0]); ++i) {
+        if (gr_regs[i].off == off) return &gr_regs[i];
+    }
+    return NULL;
+}
+
+static bool gr_dispatch_read(sound_hda_dev_t *hda, size_t offset,
+                             void *data, uint8_t size)
+{
+    const gr_reg_t *r = gr_reg_lookup((uint16_t)offset);
+    if (r == NULL) return false;
+    uint32_t v = 0;
+    switch (r->kind) {
+        case GR_REG_RW_FIELD:
+        case GR_REG_RO_FIELD:
+            v = reg_field_load(hda, r->field_off, r->field_size);
+            break;
+        case GR_REG_RO_CONST:
+            v = r->const_val;
+            break;
+        case GR_REG_RO_FN:
+            v = r->read_fn(hda);
+            break;
+        case GR_REG_ACTION:
+            // ACTION may have a custom read (e.g. GCTL composes UNSOL
+            // bit) or default to backing-field read.
+            v = r->read_fn ? r->read_fn(hda)
+                           : reg_field_load(hda, r->field_off, r->field_size);
+            break;
+    }
+    mmio_store(data, size, v);
+    return true;
+}
+
+static bool gr_dispatch_write(sound_hda_dev_t *hda, size_t offset,
+                              const void *data, uint8_t size)
+{
+    const gr_reg_t *r = gr_reg_lookup((uint16_t)offset);
+    if (r == NULL) return false;
+    uint32_t v = mmio_load(data, size);
+    switch (r->kind) {
+        case GR_REG_RW_FIELD:
+            reg_field_store(hda, r->field_off, r->field_size, v);
+            break;
+        case GR_REG_RO_FIELD:
+        case GR_REG_RO_FN:
+        case GR_REG_RO_CONST:
+            // Read-only — writes ignored.
+            break;
+        case GR_REG_ACTION:
+            r->write_fn(hda, v);
+            break;
+    }
+    return true;
+}
 
 static void sound_hda_remove(rvvm_mmio_dev_t* dev)
 {
@@ -421,27 +1139,41 @@ static void sound_hda_remove(rvvm_mmio_dev_t* dev)
     // moment the caller frees the PCI state. Log a one-shot warning
     // after 5 s as a diagnostic breadcrumb for a wedged backend.
     sound_hda_dev_t *hda = dev->data;
-    if (hda != NULL) {
-        sound_hda_stream_t *stream = &hda->stream_output;
-        atomic_store_uint32_relax(&stream->running, 0);
-        // Unblock a worker stuck inside subsystem.write before we start
-        // waiting. Without this, blocking backends (ALSA PCM mid-xrun,
-        // IPC sinks, any callback that doesn't poll running itself)
-        // stall teardown for as long as the host takes to drain — which
-        // for PipeWire under load can be seconds. Non-blocking backends
-        // leave abort NULL; the running check in sound_hda_stream_drain
-        // is enough for them.
-        if (hda->subsystem.abort != NULL) {
-            hda->subsystem.abort(&hda->subsystem);
-        }
-        uint32_t waited_ms = 0;
-        while (atomic_load_uint32_relax(&stream->worker_alive)) {
-            sleep_ms(5);
-            waited_ms += 5;
-            if (waited_ms == 5000) {
-                DO_ONCE(rvvm_warn("sound_hda_remove: stream worker still alive"
-                                  " after 5 s; backend may be blocking"));
+    if (hda == NULL) return;
+
+    // Ask every stream worker to stop.
+    for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        atomic_store_uint32_relax(&hda->streams[i].running, 0);
+    }
+    // Same for the beep worker (lifetime parallels stream workers).
+    atomic_store_uint32_relax(&hda->beep_running, 0);
+    // Unblock any worker stuck inside subsystem.write before we start
+    // waiting. Without this, blocking backends (ALSA PCM mid-xrun, IPC
+    // sinks, any callback that doesn't poll running itself) stall
+    // teardown for as long as the host takes to drain — which for
+    // PipeWire under load can be seconds. Non-blocking backends leave
+    // abort NULL; the running check in sound_hda_stream_drain is enough.
+    if (hda->subsystem.abort != NULL) {
+        hda->subsystem.abort(&hda->subsystem);
+    }
+    // Join every stream worker. Wait unbounded: hanging on teardown is
+    // recoverable (the host notices and kills the process), but
+    // returning while a worker still uses hda->pci_func is a
+    // use-after-free the moment the caller frees the PCI state.
+    uint32_t waited_ms = 0;
+    for (;;) {
+        bool any_alive = atomic_load_uint32_relax(&hda->beep_worker_alive);
+        for (size_t i = 0; !any_alive && i < HDA_STREAMS_TOTAL; ++i) {
+            if (atomic_load_uint32_relax(&hda->streams[i].worker_alive)) {
+                any_alive = true;
             }
+        }
+        if (!any_alive) break;
+        sleep_ms(5);
+        waited_ms += 5;
+        if (waited_ms == 5000) {
+            DO_ONCE(rvvm_warn("sound_hda_remove: stream worker still alive"
+                              " after 5 s; backend may be blocking"));
         }
     }
 }
@@ -451,181 +1183,66 @@ static rvvm_mmio_type_t sound_hda_type = {
     .remove = sound_hda_remove,
 };
 
+// Compose INTSTS (HDA spec §3.3.15): bits 0..29 are per-stream SIS flags
+// (set when SDnSTS has any of BCIS/FIFOE/DESE latched), bit 30 CIS, bit
+// 31 GIS = OR of everything else. The SIS bit number equals the stream's
+// descriptor index per §3.3.14.
+//
+// Earlier this hardcoded `1 << 29` (no real stream maps there) and
+// Linux's azx_interrupt silently discarded every IRQ. Iterating
+// `streams[]` keeps the read correct as new descriptors come online.
+static uint32_t sound_hda_compute_intsts(sound_hda_dev_t *hda)
+{
+    uint32_t sis = 0;
+    for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        if (hda->streams[i].status & 0x1Cu) {
+            sis |= 1u << hda->streams[i].intsts_bit;
+        }
+    }
+    if (sis) sis |= (1u << 31);  // GIS mirrors any pending SIS
+    return sis;
+}
+
+// Wall clock (HDA spec §3.3.16): 32-bit counter at 24 MHz. Used by
+// Linux's azx_position_ok as a sanity gate against bogus IRQs; returning
+// 0 here makes the driver reject every period interrupt and writers
+// stall in wait_for_avail. With a real monotonic 24 MHz counter the gate
+// passes once per period and snd_pcm_period_elapsed wakes writers.
+static uint32_t sound_hda_wallclk(void)
+{
+    return (uint32_t)rvtimer_clocksource(24000000ULL);
+}
+
+// Resolve an MMIO offset in the [0x80, 0x80 + N*0x20) range to a
+// (stream, sub_off) pair. Returns NULL on miss (offset is global or out
+// of range).
+static sound_hda_stream_t *hda_resolve_stream(sound_hda_dev_t *hda,
+                                              size_t offset, uint16_t *sub_off)
+{
+    if (offset < HDA_STREAM_BASE || offset >= HDA_STREAM_REGION_END) return NULL;
+    size_t   rel = offset - HDA_STREAM_BASE;
+    uint32_t idx = rel / HDA_STREAM_STRIDE;
+    *sub_off = rel % HDA_STREAM_STRIDE;
+    return &hda->streams[idx];
+}
+
 static bool sound_hda_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    UNUSED(size);
-
     sound_hda_dev_t *hda = dev->data;
     spin_lock(&hda->lock);
 
-    switch (offset) {
-        case SOUND_HDA_GCAP:
-            write_uint16_le(data, SOUND_HDA_PARAM_GCAP);
-            break;
-        case SOUND_HDA_VS:
-            write_uint16_le(data, SOUND_HDA_PARAM_V);
-            break;
-        case SOUND_HDA_OUTPAY:
-            write_uint16_le(data, 0x3C);
-            break;
-        case SOUND_HDA_INPAY:
-            write_uint16_le(data, 0x1D);
-            break;
-        case SOUND_HDA_GLOBAL_CTRL:
-            hda->gctl |= (1 << 8) | 1; // 1 << 8 is UNSOL
-            write_uint32_le(data, hda->gctl);
-            break;
-        case SOUND_HDA_INTR_CTRL:
-            write_uint32_le(data, hda->intr_ctrl);
-            break;
-        case SOUND_HDA_INTSTS: {
-            // INTSTS (HDA spec 3.3.13): bits 0..29 are per-stream SIS
-            // flags (SDnSTS has any latched IRQ), bit 30 CIS (CORB/RIRB),
-            // bit 31 GIS (overall OR).
-            //
-            // Stream indices follow the descriptor order ISS, OSS, BSS:
-            // we advertise 1 input + 1 output, so ISD0 is stream 0
-            // (mask 1<<0) and OSD0 is stream 1 (mask 1<<1).
-            //
-            // Prior code returned `1 << 29`, claiming "stream 29 has an
-            // IRQ". Linux's azx_interrupt does
-            //   if (status & azx_dev->sd_int_sta_mask) { ... }
-            // over its stream_list (indices 0 and 1 for us). Bit 29
-            // never matches, the output stream's IRQ is silently
-            // dropped before snd_pcm_period_elapsed runs — same
-            // "writers never wake" failure mode as a missing BCIS.
-            uint32_t sts = 0;
-            if (hda->stream_output.status & 0x1C) {
-                sts |= 1u << 1;   // OSD0 = stream index 1
-            }
-            if (sts) sts |= (1u << 31);  // GIS mirrors any pending SIS
-            write_uint32_le(data, sts);
-            break;
-        }
-        case SOUND_HDA_WALL_CLOCK: {
-            // HDA spec 3.3.18: 32-bit counter clocked at 24 MHz. Used by
-            // the Linux HDA driver (intel.c:azx_position_ok) as a sanity
-            // gate: if (now - start_wallclk) < (period_wallclk * 2/3),
-            // the IRQ is declared bogus and dropped before
-            // snd_pcm_period_elapsed runs. Returning 0 meant every IRQ
-            // was rejected, hw_ptr never advanced from the driver's POV,
-            // writers blocked in wait_for_avail until a signal arrived
-            // (mpg123: "wrote only N of M"). With a real monotonic
-            // 24 MHz counter the driver compares correctly, the gate
-            // passes once per period, and period_elapsed wakes writers.
-            //
-            // aplay @ 22 kHz mono never saw this because its byte rate
-            // (44 KB/s) is well below our BDL drain rate (96 KB/s) —
-            // the runtime buffer never filled, so wait_for_avail was
-            // never entered and WALLCLK was irrelevant.
-            uint32_t wallclk = (uint32_t)rvtimer_clocksource(24000000ULL);
-            write_uint32_le(data, wallclk);
-            break;
-        }
-        case SOUND_HDA_CORB_WP:
-            write_uint16_le(data, hda->corb_wp);
-            break;
-        case SOUND_HDA_CORB_RP:
-            write_uint16_le(data, hda->corb_rp & 0xFF);
-            break;
-        case SOUND_HDA_CORB_SIZE:
-            write_uint8(data, SOUND_HDA_PARAM_CORBSZCAP << 4 | SOUND_HDA_PARAM_CORBSIZE);
-            break;
-        case SOUND_HDA_RIRB_WP:
-            write_uint16_le(data, hda->rirb_wp & 0xFF);
-            break;
-        case SOUND_HDA_RIRB_STATUS:
-            write_uint8(data, hda->rirb_status & 0xFF);
-            // Should we reset RIRB status after read?
-            break;
-        case SOUND_HDA_RIRB_SIZE:
-            write_uint8(data, SOUND_HDA_PARAM_RIRBSZCAP << 4 | SOUND_HDA_PARAM_RIRBSIZE);
-            break;
-        case SOUND_HDA_OSD0STS: {
-            uint8_t cmd = 0;
-            if (hda->stream_output.lpib < hda->stream_output.bdl_len)
-                cmd |= 1 << 5;
-            else
-                cmd &= ~(1 << 5);
-            cmd |= hda->stream_output.status;
-            write_uint8(data, cmd);
-            break;
-        }
-        case SOUND_HDA_OSD0LPIB:
-            write_uint32_le(data, hda->stream_output.lpib);
-            break;
-        case SOUND_HDA_OSD0FIFOS:
-            write_uint16_le(data, SOUND_HDA_FIFO_SIZE);
-            break;
-
-        // Stream descriptor registers that MUST be readable so the guest's
-        // read-modify-write sequences round-trip correctly. Linux's HDA
-        // driver uses snd_hdac_stream_updateb(SD_CTL, mask, val) at stream
-        // stop, which does:
-        //
-        //   old = read(SD_CTL);
-        //   new = (old & ~mask) | val;
-        //   if (old != new) write(SD_CTL, new);
-        //
-        // If our read returns garbage (stack-local `uint64_t tmp` in
-        // riscv_load_u32 isn't zero-initialised — it carries whatever the
-        // previous JIT slot left behind), and the garbage happens to
-        // already satisfy the mask (e.g. bits 1-4 already clear), then
-        // `old == new` and Linux SKIPS the write. The stream stays
-        // running=1 in our emulator while Linux's ALSA close path
-        // proceeds under the assumption that STOP trigger fired. The
-        // worker keeps walking the BDL after the guest has freed the
-        // DMA region — reading garbage PCM, stalling teardown, and
-        // under the Ctrl+C scenario producing a hard-to-diagnose VM
-        // unresponsiveness because the guest's aplay release holds
-        // substream->lock while our worker repeatedly contends for
-        // bus->reg_lock inside (now-actually-delivered, post-IRQ-fix)
-        // period IRQs that should have been disabled by a successful
-        // stop sequence.
-        //
-        // The fix is one-for-one: every SDnCTL/SDnCBL/SDnLVI/SDnFMT/
-        // SDnBDPL/SDnBDPU field that the write path stores needs a
-        // matching read path that returns the stored value. Otherwise
-        // any guest driver that does RMW on these regs is at the mercy
-        // of uninitialised-stack contents.
-        case SOUND_HDA_OSD0CTL: {
-            // 24-bit register (3 bytes at SD_CTL..SD_CTL+2). Linux reads
-            // 1 byte for SD_CTL (SRST/RUN/IOCE/FEIE/DEIE/TP bits).
-            uint8_t ctl = 0;
-            ctl |= (hda->stream_output.srst & 1u) << 0;
-            ctl |= (atomic_load_uint32_relax(&hda->stream_output.running) ? 1u : 0u) << 1;
-            ctl |= (hda->stream_output.ioce & 1u) << 2;
-            // Bits 23:20 carry the guest-assigned stream number — used
-            // by the codec to route stream tags. We persist the full
-            // stream tag in stream->stream (see VERB_SET_CONV_STREAM_CHAN
-            // at line ~691) but don't store the SDnCTL view; low 8 bits
-            // are enough for Linux's updateb.
-            write_uint8(data, ctl);
-            break;
-        }
-        case SOUND_HDA_OSD0CBL:
-            write_uint32_le(data, hda->stream_output.bdl_len);
-            break;
-        case SOUND_HDA_OSD0LVI:
-            write_uint16_le(data, hda->stream_output.bdl_lvi);
-            break;
-        case SOUND_HDA_OSD0FMT:
-            write_uint16_le(data, hda->stream_output.fmt);
-            break;
-        case SOUND_HDA_OSD0BDPL:
-            write_uint32_le(data, hda->stream_output.bdl_lo);
-            break;
-        case SOUND_HDA_OSD0BDPU:
-            write_uint32_le(data, hda->stream_output.bdl_hi);
-            break;
-
-        default:
-            spin_unlock(&hda->lock);
-            return false;
+    // Try the global controller register table first; on miss, try the
+    // stream descriptor block (HDA spec §3.3.34: shared 0x20-byte layout
+    // for input/output/bidir streams).
+    bool ok = gr_dispatch_read(hda, offset, data, size);
+    if (!ok) {
+        uint16_t sub_off;
+        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
+        if (s != NULL) ok = sd_dispatch_read(hda, s, sub_off, data, size);
     }
 
     spin_unlock(&hda->lock);
-    return true;
+    return ok;
 }
 
 static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t response)
@@ -633,16 +1250,34 @@ static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t re
     ++hda->rirb_wp;
     hda->rirb_wp %= hda->rirb_size;
 
+    // Each RIRB entry is 8 bytes (HDA spec §3.3.27 / §4.4.2.1: response
+    // dword + response_ex dword). Map the entry, then store the two
+    // dwords at indices 0 and 1.
+    //
+    // Earlier this used `rirb_lo + rirb_wp*4` for the base (treating WP
+    // as a dword index) and then indexed `rirb[rirb_wp]` and
+    // `rirb[rirb_wp+1]` (treating WP again, this time as a dword
+    // offset on top of the already-shifted base) — two compounding
+    // errors that landed at `rirb_lo + rirb_wp*8` *only* because the
+    // host returned a pointer to a mapping wider than the 4 bytes
+    // requested. Strict bounds checking, or a RIRB allocated with a
+    // page boundary mid-ring, broke it.
     uint32_t *rirb = pci_get_dma_ptr(
         hda->pci_func,
-        (rvvm_addr_t) hda->rirb_lo + hda->rirb_wp * 4,
-        4
+        (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8,
+        8
     );
+    if (rirb == NULL) return;
 
-    uint32_t response_ex = cad;
-
-    rirb[hda->rirb_wp] = response;
-    rirb[hda->rirb_wp + 1] = response_ex;
+    rirb[0] = response;
+    rirb[1] = cad;       // response_ex (codec address in bits 3:0)
+    // We're called from sound_hda_codec_cmd, which runs with hda->lock
+    // held (gr_corb_wp_write / gr_ics_write paths). RVVM's pci_send_irq
+    // → rvvm_send_irq just queues the IRQ into the interrupt controller;
+    // the vCPU thread picks it up on its next scheduling slot, never
+    // synchronously re-entering our MMIO from this thread. So holding
+    // hda->lock across the call is safe — the worst case is a brief
+    // serialisation of the vCPU's IRQ-handler MMIO behind our unlock.
     pci_send_irq(hda->pci_func, 0);
 }
 
@@ -651,7 +1286,11 @@ static uint32_t sound_hda_codec_root_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_VENDOR_ID:
-            return SOUND_DEVICE_ID_CMEDIA;
+            // HDA spec §7.3.4.1: bits 31:16 = Vendor ID, 15:0 = Device
+            // ID. Returning just the device ID left vendor=0 — Linux's
+            // generic codec path still bound, but any driver that
+            // matches on vendor (or logs it for diagnostics) saw 0x0000.
+            return ((uint32_t)SOUND_VENDOR_ID_CMEDIA << 16) | SOUND_DEVICE_ID_CMEDIA;
 
         case CODEC_PARAM_REVISION_ID:
             return 0xFFFF;
@@ -669,7 +1308,7 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_SUB_NODE_COUNT:
-            return 0x00020002; // 2 Subnode, StartNid = 2
+            return 0x00030002; // 3 Subnodes (NIDs 2, 3, 4) starting at NID 2
 
         case CODEC_PARAM_FUNC_GROUP_TYPE:
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
@@ -716,7 +1355,11 @@ static uint32_t sound_hda_codec_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_VENDOR_ID:
-            return SOUND_DEVICE_ID_CMEDIA;
+            // HDA spec §7.3.4.1: bits 31:16 = Vendor ID, 15:0 = Device
+            // ID. Returning just the device ID left vendor=0 — Linux's
+            // generic codec path still bound, but any driver that
+            // matches on vendor (or logs it for diagnostics) saw 0x0000.
+            return ((uint32_t)SOUND_VENDOR_ID_CMEDIA << 16) | SOUND_DEVICE_ID_CMEDIA;
 
         case CODEC_PARAM_REVISION_ID:
             return 0xFFFF;
@@ -779,16 +1422,45 @@ static uint32_t sound_hda_codec_pin_output_cmd(uint32_t payload)
     }
 }
 
+// NID = 4 — Beep Generator widget (HDA spec §7.2.3.8 / §7.3.4.6).
+// Type code 7 (bits 23:20 of widget caps). Includes AMP_OUT so Linux
+// exposes a "Beep Playback Volume" / "Beep Playback Switch" alsa
+// control bound to the per-widget AMP_GAIN_MUTE verbs.
+static uint32_t sound_hda_codec_beep_cmd(uint32_t payload)
+{
+    switch (payload) {
+        case CODEC_PARAM_AUDIO_WIDGET_CAPS:
+            // Type=7 (Beep Generator), AMP_OVR + AMP_OUT so the widget
+            // exposes its own amp instead of inheriting the FG's. No
+            // STEREO bit (beep is a single-channel tone). No CONN_LIST
+            // — per spec §7.2.3.8 "this node is never listed on any
+            // other node's connection list."
+            return (7u << 20)
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OVR
+                 | CODEC_PARAM_AUDIO_WIDGET_CAPS_AMP_OUT;
+
+        case CODEC_PARAM_OUTPUT_AMP_CAPS:
+            // Same amp range as the main output — keeps the per-control
+            // dB ↔ percent mapping consistent in alsamixer.
+            return CODEC_PARAM_OUTPUT_AMP_CAPS_MUTE_CAP
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_NUMSTEPS
+                 | CODEC_PARAM_OUTPUT_AMP_CAPS_OFFSET;
+
+        default:
+            return 0;
+    }
+}
+
 #define NODE_ID_ROOT       0 // Root node
 #define NODE_ID_FG_OUTPUT  1 // Output function group
-#define NODE_ID_OUTPUT     2 // Output
-#define NODE_ID_PIN_OUTPUT 3 // Pin output
+#define NODE_ID_OUTPUT     2 // Output converter widget
+#define NODE_ID_PIN_OUTPUT 3 // Pin output widget
+#define NODE_ID_BEEP       4 // Beep Generator widget (§7.2.3.8)
 
 static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t nid, uint32_t verb, uint32_t payload)
 {
     uint32_t response = 0;
-    uint8_t  mute = 0;
-    uint8_t  gain = 0;
 
     switch (verb) {
         case VERB_GET_CONV_FMT:
@@ -797,31 +1469,57 @@ static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t 
         case VERB_SET_CONV_FMT:
             stream->fmt = payload;
             break;
-        case VERB_GET_AMP_GAIN_MUTE:
-            if (payload & VERB_GET_AMP_GAIN_MUTE_LEFT) {
-                response = stream->left_gain | stream->left_mute;
-            }
-
-            if (payload & VERB_GET_AMP_GAIN_MUTE_RIGHT) {
-                response = stream->right_gain | stream->right_mute;
-            }
-
+        case VERB_GET_AMP_GAIN_MUTE: {
+            // HDA spec §7.3.3.7 Get payload (Figure 62): bit 13 selects
+            // left (1) vs right (0) channel; bit 15 selects output (1)
+            // vs input (0). Our codec advertises output amps only, so
+            // bit 15 doesn't change which side we read.
+            //
+            // Earlier this used `payload & VERB_GET_AMP_GAIN_MUTE_RIGHT`
+            // (== `& 0`) which is always false, so right-channel reads
+            // returned 0 unconditionally. ALSA's mixer state for the
+            // right channel was a permanent 0 / mute regardless of what
+            // the guest had set.
+            bool left = (payload & VERB_GET_AMP_GAIN_MUTE_LEFT) != 0;
+            uint8_t mute = left ? stream->left_mute : stream->right_mute;
+            uint8_t gain = left ? stream->left_gain : stream->right_gain;
+            // Get response (Figure 63): bit 7 mute, bits 6:0 gain.
+            response = ((uint32_t)(mute & 1u) << 7) | (gain & 0x7Fu);
             break;
-        case VERB_SET_AMP_GAIN_MUTE:
-            mute = VERB_SET_AMP_GAIN_MUTE_MUTE;
-            gain = VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
-
-            if (payload & VERB_SET_AMP_GAIN_MUTE_LEFT) {
-                stream->left_mute = mute;
-                stream->left_gain = gain;
+        }
+        case VERB_SET_AMP_GAIN_MUTE: {
+            // HDA spec §7.3.3.7 Set payload (Figure 64): bit 15 Set
+            // Output, 14 Set Input, 13 Set Left, 12 Set Right, 7 Mute,
+            // 6:0 Gain. Earlier this stored fixed mask constants
+            // (`0x80` mute, `0x07` gain) regardless of payload — every
+            // guest write left mute=on and gain=7 forever; ALSA volume
+            // controls were dead.
+            //
+            // Codec advertises output amps only — Set Input bit is a
+            // no-op for us. Spec also says: "if neither Set Left nor
+            // Set Right is set, the command is effectively a no-op."
+            if (payload & VERB_SET_AMP_GAIN_MUTE_OUTPUT) {
+                uint8_t mute = (payload & VERB_SET_AMP_GAIN_MUTE_MUTE) ? 1u : 0u;
+                uint8_t gain = payload & VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
+                if (payload & VERB_SET_AMP_GAIN_MUTE_LEFT) {
+                    stream->left_mute = mute;
+                    stream->left_gain = gain;
+                }
+                if (payload & VERB_SET_AMP_GAIN_MUTE_RIGHT) {
+                    stream->right_mute = mute;
+                    stream->right_gain = gain;
+                }
+                // Recompute the worker's amplitude factor. Codec is
+                // mono-advertised (no STEREO bit on NID 2 caps), so
+                // the output is driven by the left channel per spec
+                // §7.3.3.7 ("if the widget only supports a single
+                // channel, [Right is] ignored and the value programmed
+                // applies to the left").
+                stream->gain_q15 = hda_gain_to_q15(stream->left_gain,
+                                                   stream->left_mute);
             }
-
-            if (payload & VERB_SET_AMP_GAIN_MUTE_RIGHT) {
-                stream->right_mute = mute;
-                stream->right_gain = gain;
-            }
-
             break;
+        }
         case VERB_GET_CONV_STREAM_CHAN:
             response = (stream->stream << 4) | stream->channel;
             break;
@@ -888,6 +1586,9 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             case NODE_ID_PIN_OUTPUT:
                 response = sound_hda_codec_pin_output_cmd(payload);
                 break;
+            case NODE_ID_BEEP:
+                response = sound_hda_codec_beep_cmd(payload);
+                break;
             }
 
             break;
@@ -903,10 +1604,55 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
             response = hda->power_state | (hda->power_state << 4);
             break;
         case VERB_GET_PIN_WIDGET_CTRL:
-            response = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+            // §7.3.3.13: returns the pin widget control byte. Single
+            // pin widget today (NID 3); multi-pin codecs would key by nid.
+            response = hda->pin_ctrl;
+            break;
+        case VERB_SET_PIN_WIDGET_CTRL:
+            // §7.3.3.13: payload bits 7:0 are the new pin control byte.
+            // Was silently dropped — Linux's pin power-up writes this
+            // to enable output, then reads it back to confirm. With no
+            // store the read returned a constant; round-trip happened
+            // to look correct only because Linux happens to write the
+            // same OUT_ENABLE bit the GET hardcoded.
+            hda->pin_ctrl = payload & 0xFFu;
             break;
         case VERB_GET_PIN_SENSE:
             response = VERB_GET_PIN_SENSE_PRESENSE_PLUGGED;
+            break;
+        case VERB_GET_BEEP_GENERATION:
+            // §7.3.3.31: response bits 7:0 are the current divider; 0 = off.
+            response = hda->beep_divider;
+            break;
+        case VERB_SET_BEEP_GENERATION:
+            // §7.3.3.31: payload bits 7:0 are divider. 0 disables;
+            // non-zero starts a tone at 48000 / (4 * divider) Hz.
+            sound_hda_beep_set(hda, payload & 0xFFu);
+            break;
+        case VERB_GET_AMP_GAIN_MUTE:
+            // Beep widget (NID 4) has its own mono amp; stream amp
+            // (NID 2) goes through the per-stream dispatcher below.
+            if (nid == NODE_ID_BEEP) {
+                response = ((uint32_t)(hda->beep_mute & 1u) << 7)
+                         | (hda->beep_gain & 0x7Fu);
+            } else if (nid == NODE_ID_OUTPUT) {
+                response = sound_hda_codec_stream_cmd(hda_output_stream(hda),
+                                                      nid, verb, payload);
+            }
+            break;
+        case VERB_SET_AMP_GAIN_MUTE:
+            if (nid == NODE_ID_BEEP) {
+                // Mono — spec §7.3.3.7: "if the widget only supports a
+                // single channel, [right] bits are ignored." Either
+                // LEFT or RIGHT in the payload writes the single value.
+                if (payload & VERB_SET_AMP_GAIN_MUTE_OUTPUT) {
+                    hda->beep_mute = (payload & VERB_SET_AMP_GAIN_MUTE_MUTE) ? 1u : 0u;
+                    hda->beep_gain = payload & VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
+                }
+            } else if (nid == NODE_ID_OUTPUT) {
+                sound_hda_codec_stream_cmd(hda_output_stream(hda),
+                                           nid, verb, payload);
+            }
             break;
         case VERB_GET_CONN_LIST_ENTRY:
             response = NODE_ID_OUTPUT;
@@ -917,10 +1663,41 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                      | VERB_GET_CONFIG_DEFAULT_ASSOCIATION_DEFAULT
                      | VERB_GET_CONFIG_DEFAULT_COLOR_ORANGE;
             break;
+        case VERB_FUNCTION_RESET:
+            // HDA spec §7.3.3.33 verb 0x7FF — reset the function group
+            // and all its widgets to power-on values. Configuration
+            // Defaults must NOT be reset (we don't store any per-instance
+            // overrides for them anyway). Response is 0.
+            //
+            // Targets the Audio Function Group (NID 1); for our topology
+            // that's a single output converter (NID 2) plus pin output
+            // (NID 3). Reset both the converter's codec-side state and
+            // the pin widget control byte to power-on defaults.
+            if (nid == NODE_ID_FG_OUTPUT || nid == NODE_ID_OUTPUT) {
+                sound_hda_stream_t *s = hda_output_stream(hda);
+                s->fmt        = 0;
+                s->channel    = 0;
+                s->stream     = 0;
+                // Spec §7.3.3.7: gain defaults to Offset (0 dB), mute
+                // "should default to 1 on codec reset." Linux's HDA
+                // generic codec unmutes primary output paths during the
+                // post-reset re-probe; matches our power-on default in
+                // sound_hda_init_ex.
+                s->left_gain  = HDA_AMP_OFFSET;
+                s->right_gain = HDA_AMP_OFFSET;
+                s->left_mute  = 1;
+                s->right_mute = 1;
+                s->gain_q15   = 0;
+                // §7.3.3.13: pin widget control resets to power-on
+                // default. Match init.
+                hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+            }
+            response = 0;
+            break;
         default:
             switch (nid) {
             case NODE_ID_OUTPUT:
-                response = sound_hda_codec_stream_cmd(&hda->stream_output, nid, verb, payload);
+                response = sound_hda_codec_stream_cmd(hda_output_stream(hda), nid, verb, payload);
                 break;
             }
             break;
@@ -933,9 +1710,14 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
 // until the guest clears running (or an unrecoverable condition bails).
 // Separate from the worker-lifetime loop below so early-bail paths can
 // just return without touching worker_alive.
-static void sound_hda_stream_drain(sound_hda_dev_t *hda)
+//
+// Operates on a single stream descriptor — generic across input/output/
+// bidir streams. Today only output streams have a write_fn backend wired
+// in init, so the drain on input streams burns its pacing loop and
+// silently advances LPIB; the guest sees an idle but functional stream.
+static void sound_hda_stream_drain(sound_hda_stream_t *stream)
 {
-    sound_hda_stream_t *stream = &hda->stream_output;
+    sound_hda_dev_t *hda = stream->hda;
 
     // Pace the worker to the stream's configured bytes-per-second.
     // Without pacing, non-blocking backends (ring buffers, null sinks)
@@ -959,28 +1741,56 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
     // format (Linux HDA likes to configure stereo streams even for mono
     // content, doubling the true byte rate). Deriving from fmt is the
     // only way to be robust across guest driver choices.
-    uint16_t fmt             = stream->fmt;
-    uint32_t channels        = (fmt & 0xF) + 1;
-    uint32_t bits_code       = (fmt >> 4) & 7;
-    uint32_t bits_per_sample = bits_code == 0 ? 8  : bits_code == 1 ? 16 :
-                               bits_code == 2 ? 20 : bits_code == 3 ? 24 : 32;
-    uint32_t bytes_per_frame = channels * ((bits_per_sample + 7) / 8);
-    uint32_t div             = ((fmt >> 8)  & 7) + 1;
-    uint32_t mult            = ((fmt >> 11) & 7) + 1;
-    uint32_t base_hz         = (fmt & (1 << 14)) ? 44100 : 48000;
-    uint64_t sample_rate_hz  = (uint64_t)base_hz * mult / div;
+    uint16_t fmt              = stream->fmt;
+    uint32_t channels         = (fmt & 0xF) + 1;
+    uint32_t bytes_per_sample = hda_fmt_container_bytes[(fmt >> 4) & 7];
+    uint32_t mult_code        = (fmt >> 11) & 7;
+    uint32_t div              = ((fmt >> 8) & 7) + 1;
+    uint32_t base_hz          = (fmt & (1u << 14)) ? 44100 : 48000;
+    // Reject formats the spec marks reserved or that we don't render:
+    //   - bit 15 TYPE=1 (Non-PCM): codec advertises PCM only
+    //   - BITS code 5..7: container size 0 in the lookup table
+    //   - MULT code 4..7: spec 3.3.41 / 3.7.1 reserved
+    // Folded into the same bail-and-let-guest-retry path as fmt=0 below.
+    bool fmt_valid = (fmt & (1u << 15)) == 0
+                  && bytes_per_sample != 0
+                  && mult_code <= 3;
+    uint64_t sample_rate_hz = (uint64_t)base_hz * (mult_code + 1) / div;
+    uint32_t bytes_per_frame = channels * bytes_per_sample;
     uint64_t SAMPLE_RATE_BYTES_PER_SEC = sample_rate_hz * bytes_per_frame;
-    if (SAMPLE_RATE_BYTES_PER_SEC == 0) {
-        // Guest wrote run=1 before configuring the format. Bail out
-        // like the NULL-dma case — driver will retry properly.
+    if (!fmt_valid || SAMPLE_RATE_BYTES_PER_SEC == 0) {
+        // Guest wrote run=1 before configuring the format, or programmed
+        // an encoding the spec marks reserved. Bail like the NULL-dma
+        // case — driver will retry properly.
         atomic_store_uint32_relax(&stream->running, 0);
         return;
+    }
+    // §3.3.38: "CBL must represent an integer number of samples." Not
+    // enforced by us (we don't know FMT at CBL write time, and rejecting
+    // would silently break the stream), but log it so guest bugs are
+    // visible. LPIB will wrap mid-sample and the guest's hw_ptr math
+    // will drift; that's the guest's fault.
+    if (stream->bdl_len % bytes_per_frame != 0) {
+        DO_ONCE(rvvm_debug("sound-hda: SDnCBL=%u not a multiple of frame size"
+                           " %u (channels=%u, bytes/sample=%u) — spec §3.3.38",
+                           stream->bdl_len, bytes_per_frame,
+                           channels, bytes_per_sample));
     }
     uint64_t       paced_start_ns  = 0;
     uint64_t       paced_bytes_out = 0;
 
     uint32_t total = stream->bdl_lvi + 1;
-    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, stream->bdl_len);
+    // Map the BDL itself, not the audio data it points to. Each BDL
+    // entry is 16 bytes (HDA spec §3.6.3: 8-byte address + 4-byte
+    // length + 4-byte flags), so the total BDL byte size is
+    // (lvi+1)*16. Earlier this passed `stream->bdl_len` (which is the
+    // SDnCBL audio data total — often 64–256 KB) — pci_get_dma_ptr's
+    // forgiving range handling let it work in practice, but a strict
+    // bounds check or a BDL allocated near the edge of its mapping
+    // would land us reading past the end of the BDL into adjacent
+    // (or unmapped) guest memory.
+    uint64_t bdl_bytes = (uint64_t)total * 16;
+    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, bdl_bytes);
 
     // If the guest set up the stream control register without a valid BDL
     // (bdl_lo == 0 or invalid), pci_get_dma_ptr returns NULL. Bail out
@@ -997,6 +1807,29 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
             uint64_t addr = bdle[0];
             uint32_t len  = bdle[1] & 0xFFFFFFFF;
             uint8_t  ioc  = bdle[1] >> 32 & 1;
+
+            // §3.6.3: "The buffer length must be at least one Word."
+            // A zero-length entry is a guest spec violation. Skip the
+            // backend write (avoids degenerate snd_pcm_writei(buf, 0)
+            // calls) but still latch IOC and advance LPIB by 0 so the
+            // guest's bookkeeping isn't disturbed.
+            if (len == 0) {
+                DO_ONCE(rvvm_debug("sound-hda: zero-length BDL entry at idx %u"
+                                   " — spec §3.6.3", i));
+                if (!atomic_load_uint32_relax(&stream->running)) return;
+                if (ioc) {
+                    spin_lock(&hda->lock);
+                    stream->status |= 0x04;
+                    uint8_t  ioce = stream->ioce;
+                    uint32_t ic   = hda->intr_ctrl;
+                    spin_unlock(&hda->lock);
+                    if (ioce && (ic & (1u << 31))
+                             && (ic & (1u << stream->intsts_bit))) {
+                        pci_send_irq(hda->pci_func, 0);
+                    }
+                }
+                continue;
+            }
 
             // Dispatch PCM to the configured host-side backend. If no backend
             // was installed at init time (neither a compile-time USE_ALSA nor
@@ -1021,10 +1854,34 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
                     // memcpy from NULL. Pacing still advances below so
                     // LPIB keeps moving and the guest can recover.
                 } else if (channels == 1) {
-                    hda->subsystem.write(&hda->subsystem, pcm, len);
-                } else if (bits_per_sample == 16) {
+                    // Mono fast path — but we still need to apply the
+                    // codec amp's gain/mute (HDA spec §7.3.3.7).
+                    // Q15 multiply per sample; unity (32768) skips the
+                    // copy and writes the guest buffer directly.
+                    int32_t q15 = stream->gain_q15;
+                    if (q15 == 32768) {
+                        hda->subsystem.write(&hda->subsystem, pcm, len);
+                    } else {
+                        size_t frames = len / 2;            // 16-bit mono
+                        int16_t *src = (int16_t*)pcm;
+                        int16_t  scaled[4096];
+                        size_t emitted = 0;
+                        while (emitted < frames) {
+                            size_t chunk = frames - emitted;
+                            if (chunk > 4096) chunk = 4096;
+                            for (size_t f = 0; f < chunk; f++) {
+                                scaled[f] = (int16_t)(((int32_t)src[emitted + f] * q15) >> 15);
+                            }
+                            hda->subsystem.write(&hda->subsystem, scaled, chunk * 2);
+                            emitted += chunk;
+                        }
+                    }
+                } else if (bytes_per_sample == 2) {
                     // Common case: 16-bit multi-channel → 16-bit mono.
                     // Stack-allocate — BDL entries are small (256-4096 B).
+                    // Apply the codec amp gain during the channel
+                    // averaging — saves a second pass over the buffer.
+                    int32_t q15           = stream->gain_q15;
                     size_t frame_bytes_in = (size_t)bytes_per_frame;
                     size_t frames         = len / frame_bytes_in;
                     int16_t *src = (int16_t*)pcm;
@@ -1039,7 +1896,8 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
                             for (uint32_t c = 0; c < channels; c++) {
                                 sum += src[base + c];
                             }
-                            mono_buf[f] = (int16_t)(sum / (int32_t)channels);
+                            int32_t mono = sum / (int32_t)channels;
+                            mono_buf[f] = (int16_t)((mono * q15) >> 15);
                         }
                         hda->subsystem.write(&hda->subsystem, mono_buf, chunk_frames * 2);
                         bytes_emitted += chunk_frames * 2;
@@ -1107,41 +1965,31 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
                 //
                 // Serialize the latch against the MMIO-side reader/clearer
                 // (sound_hda_mmio_read/_write hold hda->lock while touching
-                // stream_output.status at offsets OSD0STS/INTSTS). Without
-                // the lock this is a torn-byte race that can drop a newly-
-                // set BCIS under an in-flight clear and lose the period IRQ.
+                // stream->status via the SD register table). Without the
+                // lock this is a torn-byte race that can drop a newly-set
+                // BCIS under an in-flight clear and lose the period IRQ.
                 spin_lock(&hda->lock);
-                hda->stream_output.status |= 0x04;
+                stream->status |= 0x04;
                 // Gate the PCI IRQ raise on the guest-published enables
-                // (HDA spec 3.3.14 / 3.3.36):
+                // (HDA spec §3.3.14 / §3.3.36):
                 //
                 //   IOCE  — SDnCTL bit 2, per-stream "raise IRQ on BDL IOC"
                 //   SIE   — INTCTL bit N, per-stream interrupt enable
-                //           (N = stream index in ISS/OSS/BSS order; OSD0 = 1)
+                //           (N = stream's descriptor index in ISS/OSS/BSS
+                //           order — cached as stream->intsts_bit at init)
                 //   GIE   — INTCTL bit 31, controller-global interrupt enable
                 //
                 // All three must be set for the stream's IOC event to drive
-                // the PCI INTx/MSI line. Ignoring them was benign before
-                // commit 3286526 because INTSTS returned a mis-indexed bit
-                // that Linux's azx_interrupt silently discarded — so IRQs
-                // we raised were never observed. With INTSTS corrected,
-                // Linux's ISR actually runs on every raise, and raising
-                // after the guest has disabled interrupts (stream close,
-                // suspend, etc.) produces a spurious IRQ cascade that
-                // preempts the guest vCPU while its ALSA teardown path
-                // holds hda->lock via MMIO — a self-contended freeze
-                // reported as "the VM locks up when aplay is Ctrl+C'd".
+                // the PCI INTx/MSI line. Raising while the guest has
+                // interrupts disabled (stream close, suspend, etc.) produces
+                // a spurious IRQ cascade that preempts the guest vCPU while
+                // its ALSA teardown path holds hda->lock via MMIO — a
+                // self-contended freeze.
                 uint8_t  ioce = stream->ioce;
                 uint32_t ic   = hda->intr_ctrl;
                 spin_unlock(&hda->lock);
                 bool gie = (ic & (1u << 31)) != 0;
-                // TODO: hardcoded OSD0 = stream index 1. The worker only
-                // services the single output stream today, but if input
-                // (ISDn) or additional output streams get wired, this gate
-                // needs to consult the per-stream INTCTL bit derived from
-                // the actual stream index (ISS+OSS+BSS layout per spec
-                // 3.3.14), not a literal 1.
-                bool sie = (ic & (1u << 1))  != 0;
+                bool sie = (ic & (1u << stream->intsts_bit)) != 0;
                 if (ioce && gie && sie) {
                     pci_send_irq(hda->pci_func, 0);
                 }
@@ -1150,10 +1998,110 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
     }
 }
 
-static void *sound_hda_stream_worker(void *arg)
+// Beep generator worker (HDA spec §7.2.3.8 / §7.3.3.31). Runs whenever
+// hda->beep_running is set; generates a square wave at 48000/(4*divider)
+// Hz mixed at the beep widget's amp gain, fed to the same backend the
+// stream worker uses. Same lockless single-worker pattern as the stream
+// worker — beep_worker_alive CAS gate, post-exit re-check for missed
+// wakeups.
+static void *sound_hda_beep_worker(void *arg)
 {
     sound_hda_dev_t *hda = arg;
-    sound_hda_stream_t *stream = &hda->stream_output;
+    // Square-wave state: alternates sign every half-period.
+    int16_t  sample_value = 0;
+    uint32_t half_period_remaining = 0;
+    uint32_t cur_divider = 0;
+
+    uint64_t paced_start_ns  = 0;
+    uint64_t paced_bytes_out = 0;
+    const uint32_t SAMPLE_RATE_HZ = 48000;
+    const uint32_t BYTES_PER_SAMPLE = 2;            // 16-bit mono
+
+    for (;;) {
+        while (atomic_load_uint32_relax(&hda->beep_running)) {
+            uint8_t divider = hda->beep_divider;
+            if (divider == 0) {
+                atomic_store_uint32_relax(&hda->beep_running, 0);
+                break;
+            }
+            // Re-derive the half-period if divider changed mid-tone.
+            if (divider != cur_divider) {
+                cur_divider = divider;
+                // freq = 48000 / (4 * divider), period_samples = 4*divider
+                half_period_remaining = 2u * (uint32_t)divider;
+                sample_value = 0;
+            }
+
+            // Generate one ~10 ms chunk per iteration so divider /
+            // gain / mute changes propagate quickly.
+            int16_t buf[480];   // 480 samples = 10 ms @ 48 kHz
+            uint8_t mute = hda->beep_mute;
+            uint8_t gain = hda->beep_gain;
+            int32_t q15  = hda_gain_to_q15(gain, mute);
+            for (size_t i = 0; i < 480; ++i) {
+                if (half_period_remaining == 0) {
+                    // Toggle. Use ~50% of full-scale so the tone is
+                    // present but not deafening before the per-widget
+                    // amp scales it.
+                    sample_value = (sample_value > 0) ? -16384 : 16384;
+                    half_period_remaining = 2u * cur_divider;
+                }
+                buf[i] = (int16_t)(((int32_t)sample_value * q15) >> 15);
+                half_period_remaining--;
+            }
+
+            if (hda->subsystem.write != NULL) {
+                hda->subsystem.write(&hda->subsystem, buf, sizeof(buf));
+            }
+
+            // Wall-clock pacing — same shape as sound_hda_stream_drain.
+            paced_bytes_out += sizeof(buf);
+            uint64_t now_ns = rvtimer_clocksource(1000000000ULL);
+            if (paced_start_ns == 0) {
+                paced_start_ns = now_ns;
+            } else {
+                uint64_t expected_ns = paced_bytes_out * 1000000000ULL
+                                     / ((uint64_t)SAMPLE_RATE_HZ * BYTES_PER_SAMPLE);
+                uint64_t elapsed_ns  = now_ns - paced_start_ns;
+                if (expected_ns > elapsed_ns) {
+                    sleep_ns(expected_ns - elapsed_ns);
+                } else if (elapsed_ns > expected_ns + 100000000ULL) {
+                    paced_start_ns  = now_ns;
+                    paced_bytes_out = 0;
+                }
+            }
+        }
+
+        atomic_store_uint32_relax(&hda->beep_worker_alive, 0);
+        if (!atomic_load_uint32_relax(&hda->beep_running))
+            return NULL;
+        if (!atomic_cas_uint32(&hda->beep_worker_alive, 0, 1))
+            return NULL;
+        // Re-claimed; loop continues with the new beep state.
+    }
+}
+
+// Beep enable/disable — driven by VERB_SET_BEEP_GENERATION. Divider
+// 0 stops; non-zero starts (or updates the frequency of) the tone.
+// Single tone at a time across the whole codec; beep is intrinsically
+// global per spec §7.2.3.8 ("the codec generates the beep tone on all
+// Pin Complexes that are currently configured as outputs").
+static void sound_hda_beep_set(sound_hda_dev_t *hda, uint8_t divider)
+{
+    hda->beep_divider = divider;
+    if (divider == 0) {
+        atomic_store_uint32_relax(&hda->beep_running, 0);
+        return;
+    }
+    atomic_store_uint32_relax(&hda->beep_running, 1);
+    if (atomic_cas_uint32(&hda->beep_worker_alive, 0, 1)) {
+        thread_create_task(sound_hda_beep_worker, hda);
+    }
+}
+
+static void *sound_hda_stream_worker(void *arg)
+{
+    sound_hda_stream_t *stream = arg;
 
     // Worker lifetime is published via worker_alive. Loop handles a narrow
     // missed-wakeup window: guest writes run=1 after we read running=0 but
@@ -1161,9 +2109,10 @@ static void *sound_hda_stream_worker(void *arg)
     // and skips, leaving no worker for a running stream. We catch that by
     // re-reading running after the clear, and re-claim the slot to drain
     // again. If a concurrent spawn already won the CAS, they own the next
-    // drain — we exit. Either way, exactly one worker runs at a time.
+    // drain — we exit. Either way, exactly one worker runs at a time per
+    // stream descriptor.
     for (;;) {
-        sound_hda_stream_drain(hda);
+        sound_hda_stream_drain(stream);
 
         atomic_store_uint32_relax(&stream->worker_alive, 0);
 
@@ -1175,202 +2124,166 @@ static void *sound_hda_stream_worker(void *arg)
     }
 }
 
-static void sound_hda_output_stream_ctl(sound_hda_dev_t *hda, uint32_t cmd)
+// SDnCTL action — invoked by the SD register dispatch on every guest
+// write to offset 0x00 of any stream descriptor. Same body for input,
+// output, and bidir streams; only the worker spawn is output-specific
+// today (input-stream worker would consume from a host source instead).
+//
+// HDA spec §3.3.35: writing SRST=1 enters reset; the controller must
+// report SRST=1 in subsequent reads so software's reset-entry poll
+// succeeds, then writing SRST=0 exits reset. Linux's
+// snd_hdac_stream_reset() polls up to 300×3μs for each transition.
+//
+// SRST=1 also resets the stream's per-stream registers per §3.3.35:
+// "While in reset, the corresponding stream's registers and associated
+// stream FIFO are reset." We clear LPIB and status on the 0→1 edge;
+// BDL/FMT/CBL/LVI stay because Linux always rewrites them after
+// observing SRST=0.
+static void sound_hda_stream_ctl_action(sound_hda_dev_t *hda,
+                                        sound_hda_stream_t *stream,
+                                        uint32_t cmd)
 {
-    uint8_t srst = (cmd >> 0) & 1;
-    uint8_t ioce = (cmd >> 2) & 1;
-    uint8_t run  = (cmd >> 1) & 1;
+    uint8_t srst    = (cmd >> 0)  & 1u;
+    uint8_t run     = (cmd >> 1)  & 1u;
+    uint8_t ioce    = (cmd >> 2)  & 1u;
+    uint8_t feie    = (cmd >> 3)  & 1u;
+    uint8_t deie    = (cmd >> 4)  & 1u;
+    uint8_t stripe  = (cmd >> 16) & 0x3u;
+    uint8_t tp      = (cmd >> 18) & 1u;
+    uint8_t strm    = (cmd >> 20) & 0xFu;
 
-    sound_hda_stream_t *stream = &hda->stream_output;
-    // Track SRST so SDnCTL reads reflect it back. HDA spec 3.3.35: writing
-    // SRST=1 enters reset; the controller must report SRST=1 in subsequent
-    // reads so software's reset-entry poll succeeds, then writing SRST=0
-    // exits reset and reads return SRST=0. Linux's snd_hdac_stream_reset()
-    // (sound/hda/hdac_stream.c) polls up to 300×3μs for each transition;
-    // without mirroring SRST, both polls time out silently and stream
-    // init stalls — visible as "card detected but plays no audio".
-    //
-    // SRST=1 also resets the stream's per-stream registers per spec 3.3.35
-    // ("While in reset, the corresponding stream's registers and associated
-    // stream FIFO are reset"). The visible symptom of skipping this: first
-    // PCM session works, second silently produces no audio. Linux opens a
-    // new substream, snd_hdac_stream_reset cycles SRST, then re-programs
-    // BDL/CBL/FMT — but LPIB and SDnSTS bits retain stale values from the
-    // previous session. The guest's hw_ptr (computed from LPIB) starts at
-    // a non-zero offset for the new buffer, falls out of sync with appl_ptr,
-    // and the writei path lands in an XRUN cascade right away.
     if (srst && !stream->srst) {
         // Edge: SRST 0→1. Reset per-stream state that real HW would clear.
-        // Don't touch BDL/FMT/CBL/LVI — Linux will rewrite those after
-        // observing SRST=0. Don't touch ioce/running — those came from the
-        // SDnCTL byte we're about to store on the same write path.
+        // Spec §3.3.35 also requires "The RUN bit must be cleared before
+        // SRST is asserted" — software's job. A misbehaving guest that
+        // sets SRST while RUN=1 would on real HW still get a reset (the
+        // stream registers and FIFO clear regardless), with RUN going to
+        // 0 as part of the reset. Force-stop the worker first to match;
+        // otherwise we'd have running=1 and no usable BDL state, and the
+        // worker would spin against zeroed pointers until guest re-RUNs.
+        atomic_store_uint32_relax(&stream->running, 0);
+        run            = 0;   // override the same write's RUN bit too
         stream->lpib   = 0;
         stream->status = 0;
     }
-    stream->srst = srst;
-    stream->ioce = ioce;
+    stream->srst     = srst;
+    stream->ioce     = ioce;
+    stream->feie     = feie;
+    stream->deie     = deie;
+    stream->stripe   = stripe;
+    stream->tp       = tp;
+    stream->ctl_strm = strm;
 
-    if (run) {
-        // Publish guest intent first, THEN gate the spawn on worker_alive.
-        // Ordering matters: a worker exiting its while-loop right now will
-        // clear worker_alive after its last running-check. If we set
-        // running=1 before it clears, our subsequent CAS will either win
-        // the slot (worker already gone) or lose it (worker still alive),
-        // and the worker's post-clear re-check of running catches the case
-        // where we lost the CAS but running=1 still needs a worker.
-        atomic_store_uint32_relax(&stream->running, 1);
-        // Gate on worker_alive (not running): running is guest intent and
-        // can flip repeatedly while a single worker drains a stream.
-        // worker_alive is owned by the worker — set here on spawn, cleared
-        // only by the worker at function return — so it stays 1 across the
-        // entire window where a second thread would trample stream state.
+    // Publish guest intent regardless of direction so MMIO RMW reads of
+    // SDnCTL round-trip the RUN bit correctly. The worker spawn is gated
+    // on direction: only output streams have a backend wired today, so
+    // spawning a drain worker on an input stream would feed BDL bytes
+    // (which the guest hasn't written yet) into the output sink. Input /
+    // bidir streams stay no-ops on RUN — the guest sees RUN=1 reflected
+    // back, then eventually times out waiting for capture data, which is
+    // the same observable behaviour as a real codec without microphone
+    // input wired up.
+    atomic_store_uint32_relax(&stream->running, run ? 1u : 0u);
+    if (run && stream->dir == HDA_STREAM_DIR_OUTPUT) {
+        // Ordering: running=1 published above, THEN gate the spawn on
+        // worker_alive. A worker exiting its while-loop right now will
+        // clear worker_alive after its last running-check; our subsequent
+        // CAS either wins the slot (worker already gone) or loses it
+        // (worker still alive), and the worker's post-clear re-check of
+        // running catches the case where we lost the CAS but running=1
+        // still needs a worker.
         if (atomic_cas_uint32(&stream->worker_alive, 0, 1)) {
-            thread_create_task(sound_hda_stream_worker, hda);
+            thread_create_task(sound_hda_stream_worker, stream);
         }
-    } else {
-        atomic_store_uint32_relax(&stream->running, 0);
+    }
+    UNUSED(hda);
+}
+
+// GCTL CRST=0 → controller reset (HDA spec §3.3.7). All state machines,
+// FIFOs, and MMIO registers clear except WAKEEN, STATESTS, and CRST
+// itself. Software is responsible for clearing CORB/RIRB RUN bits and
+// stream RUN bits before asserting CRST=0 — but a guest that ignores
+// that requirement (or a fresh probe after a previous session left
+// streams running) shouldn't leave us with stale state. Halt every
+// stream worker via the running flag, zero ring-buffer pointers, and
+// reset per-stream MMIO state. UNSOL bit (8) follows CRST.
+static void sound_hda_controller_reset(sound_hda_dev_t *hda)
+{
+    for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        sound_hda_stream_t *s = &hda->streams[i];
+        atomic_store_uint32_relax(&s->running, 0);
+        s->lpib     = 0;
+        s->status   = 0;
+        s->srst     = 0;
+        s->ioce     = 0;
+        s->feie     = 0;
+        s->deie     = 0;
+        s->stripe   = 0;
+        s->tp       = 0;
+        s->ctl_strm = 0;
+        s->bdl_lo   = 0;
+        s->bdl_hi   = 0;
+        s->bdl_len  = 0;
+        s->bdl_lvi  = 0;
+        s->fmt      = 0;
+    }
+    hda->corb_rp = 0;
+    hda->corb_wp = 0;
+    hda->rirb_rp = 0;
+    hda->rirb_wp = 0;
+    hda->intr_ctrl = 0;
+    // WAKEEN, STATESTS, power_state, codec subsystem registers are
+    // explicitly preserved per spec ("only cleared on power-on reset").
+    // We don't model wake bits today, so the preservation is moot.
+    //
+    // We don't wait for workers to drain — they bail on their next
+    // running check (within one BDL entry), and the guest's reset poll
+    // loop reads CRST=0 immediately. A worker still finishing a backend
+    // write while we return is safe because the BDL pointers are now
+    // zeroed: any new dma fetch will fail and the worker exits.
+}
+
+// CORB consumer (HDA spec §3.3.20 + §4.4.1.4). On every CORBWP write,
+// walk from RP+1 to the new WP, dispatching each verb and advancing
+// RP. A real implementation would do this asynchronously via a DMA
+// engine gated on CORBCTL.CORBRUN; we treat the WP write as the
+// trigger. Functionally indistinguishable from the spec model for
+// guests that block waiting on RIRB responses (which is everyone).
+//
+// Earlier this fetched only the entry at the new WP and never advanced
+// RP — Linux works because it bumps WP after every entry, but a guest
+// that batches commands before bumping WP would silently drop all but
+// the last. Now spec-conformant.
+static void sound_hda_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    hda->corb_wp = v & 0xFFu;
+    if (hda->corb_size == 0) return;
+    uint32_t entries = hda->corb_size / 4;
+    // Map the whole CORB once, then index in. pci_get_dma_ptr returning
+    // NULL means the guest hasn't programmed a valid base yet; bail.
+    uint32_t *corb = pci_get_dma_ptr(hda->pci_func, hda->corb_lo,
+                                     (size_t)entries * 4);
+    if (corb == NULL) return;
+    while (hda->corb_rp != hda->corb_wp) {
+        hda->corb_rp = (hda->corb_rp + 1) % entries;
+        sound_hda_codec_cmd(hda, corb[hda->corb_rp]);
     }
 }
 
 static bool sound_hda_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
-    UNUSED(size);
-
     sound_hda_dev_t *hda = dev->data;
     spin_lock(&hda->lock);
 
-    switch (offset) {
-        case SOUND_HDA_GLOBAL_CTRL:
-            hda->gctl = read_uint32_le(data);
-            break;
-        case SOUND_HDA_INTR_CTRL:
-            hda->intr_ctrl = read_uint32_le(data);
-            break;
-        case SOUND_HDA_CORB_LO:
-            hda->corb_lo = read_uint32_le(data);
-            break;
-        case SOUND_HDA_CORB_HI:
-            hda->corb_hi = read_uint32_le(data);
-            break;
-        case SOUND_HDA_CORB_WP: {
-            hda->corb_wp = read_uint16_le(data) & 0x7F;
-            uint32_t *cmd = pci_get_dma_ptr(
-                hda->pci_func,
-                (rvvm_addr_t) hda->corb_lo + hda->corb_wp * 4,
-                4
-            );
-            sound_hda_codec_cmd(hda, *cmd);
-            break;
-        }
-        case SOUND_HDA_CORB_RP: {
-            uint16_t cmd = read_uint16_le(data);
-            if (cmd & 0x8000)
-                hda->corb_rp = 0;
-            else
-                hda->corb_rp = cmd & 0x7F;
-            break;
-        }
-        case SOUND_HDA_CORB_SIZE: {
-            uint8_t cmd = read_uint8(data);
-            switch (cmd & 3) {
-            case 0: hda->corb_size =    8; break;
-            case 1: hda->corb_size =   64; break;
-            case 2: hda->corb_size = 1024; break;
-            case 3: /* Reserved */         break;
-            }
-            break;
-        }
-        case SOUND_HDA_RIRB_LO:
-            hda->rirb_lo = read_uint32_le(data);
-            break;
-        case SOUND_HDA_RIRB_HI:
-            hda->rirb_hi = read_uint32_le(data);
-            break;
-        case SOUND_HDA_RIRB_WP: {
-            uint16_t cmd = read_uint16_le(data);
-            if (cmd & 0x8000)
-                hda->rirb_wp = 0;
-            else
-                hda->rirb_wp = cmd & 0xFF;
-            break;
-        }
-        case SOUND_HDA_RIRB_INTR_CNT:
-            hda->rirb_cnt = read_uint16_le(data);
-            break;
-        case SOUND_HDA_RIRB_STATUS: {
-            uint8_t cmd = read_uint8(data);
-
-            if (cmd & 0x01)
-                hda->rirb_status &= ~0x1;
-
-            if (cmd & 0x02)
-                hda->rirb_status &= ~0x2;
-
-            break;
-        }
-        case SOUND_HDA_RIRB_SIZE: {
-            uint8_t cmd = read_uint8(data);
-            switch (cmd & 3) {
-            case 0: hda->rirb_size =   16; break;
-            case 1: hda->rirb_size =  128; break;
-            case 2: hda->rirb_size = 2048; break;
-            case 3: /* Reserved */         break;
-            }
-            break;
-        }
-        case SOUND_HDA_OSD0CTL:
-            sound_hda_output_stream_ctl(hda, read_uint32_le(data));
-            break;
-        case SOUND_HDA_OSD0STS: {
-            uint8_t cmd = read_uint8(data);
-
-            uint8_t bcis  = (cmd >> 2) & 1;
-            uint8_t fifoe = (cmd >> 3) & 1;
-            uint8_t dese  = (cmd >> 4) & 1;
-
-            if (bcis)
-                hda->stream_output.status &= ~0x04;
-
-            if (fifoe)
-                hda->stream_output.status &= ~0x08;
-
-            if (dese)
-                hda->stream_output.status &= ~0x10;
-
-            break;
-        }
-        case SOUND_HDA_OSD0CBL:
-            hda->stream_output.bdl_len = read_uint32_le(data);
-            break;
-        case SOUND_HDA_OSD0LVI:
-            hda->stream_output.bdl_lvi = read_uint32_le(data);
-            break;
-        case SOUND_HDA_OSD0FMT:
-            // Store the full 16-bit SDnFMT value so the stream worker can
-            // derive bytes-per-frame and sample rate from it (HDA spec
-            // 7.3.3.10: channels in bits 0:3, sample size 4:6, divisor
-            // 8:10, multiplier 11:13, base-rate select 14). Dropping this
-            // write left fmt=0 forever, which the worker decoded as 8-bit
-            // mono 48 kHz — pacing was correct only by accident when the
-            // codec was locked to 16-bit mono 48 kHz (the bytes_per_frame
-            // miscalculation cancelled out). With wider rate advertisement
-            // any non-48 kHz / non-16-bit stream paces wrong, producing
-            // host PCM underrun cycles audible as buzz / dropout / silence.
-            hda->stream_output.fmt = read_uint16_le(data);
-            break;
-        case SOUND_HDA_OSD0BDPL:
-            hda->stream_output.bdl_lo = read_uint32_le(data);
-            break;
-        case SOUND_HDA_OSD0BDPU:
-            hda->stream_output.bdl_hi = read_uint32_le(data);
-            break;
-        default:
-            spin_unlock(&hda->lock);
-            return false;
+    bool ok = gr_dispatch_write(hda, offset, data, size);
+    if (!ok) {
+        uint16_t sub_off;
+        sound_hda_stream_t *s = hda_resolve_stream(hda, offset, &sub_off);
+        if (s != NULL) ok = sd_dispatch_write(hda, s, sub_off, data, size);
     }
 
     spin_unlock(&hda->lock);
-    return true;
+    return ok;
 }
 
 /*
@@ -1408,6 +2321,53 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
                                     void *user_data)
 {
     sound_hda_dev_t *sound_hda = safe_new_obj(sound_hda_dev_t);
+
+    // §3.3.9 STATESTS: bit 0 = 1 announces a codec on SDIN[0]. Sticky
+    // until power-on reset, preserved across CRST. Linux's HDA driver
+    // reads STATESTS during probe to enumerate codecs.
+    sound_hda->statests = 0x0001;
+
+    // §7.3.3.13 pin widget control: power-on default is impl-specific.
+    // Default to OUT_ENABLE so a guest that doesn't explicitly enable
+    // the pin (or a minimalist driver that skips that step) still gets
+    // audio. Linux's HDA generic pin power-up overwrites this anyway.
+    sound_hda->pin_ctrl = VERB_GET_PIN_WIDGET_CTRL_OUT_ENABLE;
+
+    // Beep widget defaults — same convention as the main amp:
+    // mute=1, gain=Offset (0 dB) per spec §7.3.3.7. Linux's HDA generic
+    // codec creates "Beep Playback Switch" / "Beep Playback Volume"
+    // alsa controls bound to these via SET_AMP_GAIN_MUTE on NID 4.
+    sound_hda->beep_gain = HDA_AMP_OFFSET;
+    sound_hda->beep_mute = 1;
+
+    // Initialize per-stream identity. Descriptor index = SIE/SIS bit per
+    // HDA spec §3.3.14, sequential ISS → OSS → BSS. Today: input slot at
+    // index 0, output slot at index 1 (NO_IN=1, NO_OUT=1, NO_BSS=0).
+    for (size_t i = 0; i < HDA_STREAMS_TOTAL; ++i) {
+        sound_hda_stream_t *s = &sound_hda->streams[i];
+        s->hda        = sound_hda;
+        s->index      = (uint8_t)i;
+        s->intsts_bit = (uint8_t)i;
+        if (i < SOUND_HDA_PARAM_NO_IN) {
+            s->dir = HDA_STREAM_DIR_INPUT;
+        } else if (i < SOUND_HDA_PARAM_NO_IN + SOUND_HDA_PARAM_NO_OUT) {
+            s->dir = HDA_STREAM_DIR_OUTPUT;
+        } else {
+            s->dir = HDA_STREAM_DIR_BIDIR;
+        }
+        // Spec §7.3.3.7: amp gain defaults to Offset (0 dB), and mute
+        // "should default to 1 on codec reset." Linux's HDA generic
+        // codec unmutes primary output paths during probe via
+        // SET_AMP_GAIN_MUTE; the ScalarEvolution rootfs's
+        // /etc/local.d/scev-sound.start is the userspace safety net
+        // that unmutes + alsactl-stores on first boot. Cache q15=0 so
+        // the worker treats the pre-probe state as silent.
+        s->left_gain  = HDA_AMP_OFFSET;
+        s->right_gain = HDA_AMP_OFFSET;
+        s->left_mute  = 1;
+        s->right_mute = 1;
+        s->gain_q15   = 0;
+    }
 
     pci_func_desc_t sound_hda_desc = {
         .vendor_id  = SOUND_VENDOR_ID_CMEDIA,
