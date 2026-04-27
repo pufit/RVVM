@@ -1177,6 +1177,28 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                      | VERB_GET_CONFIG_DEFAULT_ASSOCIATION_DEFAULT
                      | VERB_GET_CONFIG_DEFAULT_COLOR_ORANGE;
             break;
+        case VERB_FUNCTION_RESET:
+            // HDA spec §7.3.3.33 verb 0x7FF — reset the function group
+            // and all its widgets to power-on values. Configuration
+            // Defaults must NOT be reset (we don't store any per-instance
+            // overrides for them anyway). Response is 0.
+            //
+            // Targets the Audio Function Group (NID 1); for our topology
+            // that's a single output converter (NID 2) plus pin output
+            // (NID 3). Reset the converter's codec-side state — the pin
+            // widget has no mutable state we track.
+            if (nid == NODE_ID_FG_OUTPUT || nid == NODE_ID_OUTPUT) {
+                sound_hda_stream_t *s = hda_output_stream(hda);
+                s->fmt        = 0;
+                s->channel    = 0;
+                s->stream     = 0;
+                s->left_gain  = 0;
+                s->right_gain = 0;
+                s->left_mute  = 0;
+                s->right_mute = 0;
+            }
+            response = 0;
+            break;
         default:
             switch (nid) {
             case NODE_ID_OUTPUT:
