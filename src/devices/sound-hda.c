@@ -308,13 +308,45 @@ enum {
 // HDA_RATE_TABLE (otherwise expands to an undeclared identifier).
 #define HDA_RATE_BIT(hz)         (1u << HDA_RATE_BIT_POS_##hz)
 
-// Sample-size advertisement bits in SUPP_PCM_SIZE_RATES (HDA spec
-// 7.3.4.1, parameter 0x0A bits 16..20).
-#define HDA_PCM_SIZE_8           (1u << 16)
-#define HDA_PCM_SIZE_16          (1u << 17)
-#define HDA_PCM_SIZE_20          (1u << 18)
-#define HDA_PCM_SIZE_24          (1u << 19)
-#define HDA_PCM_SIZE_32          (1u << 20)
+// HDA bit-depth table. Single source of truth for both the SDnFMT BITS
+// field (spec 3.3.41 / 3.7.1, bits 6:4) and the matching advertisement
+// bits in CODEC_PARAM_SUPP_PCM_SIZE_RATES (spec 7.3.4.7, bits 16..20).
+//
+// Container size is *not* ceil(bits/8): the spec mandates 32-bit
+// containers (4 bytes) for both 20-bit and 24-bit samples. Encoding the
+// container size in the same table the worker reads is the whole point —
+// the previous nested ternary in the worker derived bytes_per_sample
+// from the bit count and got 20/24-bit wrong by 1 byte (33% pacing
+// error), masked only because the codec advertised 16-bit only.
+//
+// X(bits, code, container_bytes, advert_bit):
+//   bits            — sample width, used only for naming
+//   code            — value of SDnFMT BITS field (0..4); 5..7 reserved
+//   container_bytes — bytes per sample in memory (1, 2, or 4)
+//   advert_bit      — bit position in SUPP_PCM_SIZE_RATES (16..20)
+#define HDA_BITS_TABLE(X)        \
+    X( 8, 0, 1, 16)              \
+    X(16, 1, 2, 17)              \
+    X(20, 2, 4, 18)              \
+    X(24, 3, 4, 19)              \
+    X(32, 4, 4, 20)
+
+// Advertisement-bit constants HDA_PCM_SIZE_8..HDA_PCM_SIZE_32 generated
+// from the bit-depth table; OR them into a SUPP_PCM_SIZE_RATES response.
+enum {
+#define HDA_PCM_SIZE_ENUM(bits, code, bytes, ad) HDA_PCM_SIZE_##bits = (1u << (ad)),
+    HDA_BITS_TABLE(HDA_PCM_SIZE_ENUM)
+#undef HDA_PCM_SIZE_ENUM
+};
+
+// Container size in bytes indexed by SDnFMT BITS field (0..7). Reserved
+// codes 5..7 default-init to 0; callers treat 0 as an invalid format and
+// bail (see sound_hda_stream_drain).
+static const uint8_t hda_fmt_container_bytes[8] = {
+#define HDA_BITS_BYTES_INIT(bits, code, bytes, ad) [code] = (bytes),
+    HDA_BITS_TABLE(HDA_BITS_BYTES_INIT)
+#undef HDA_BITS_BYTES_INIT
+};
 
 #define CODEC_PARAM_SUPP_STREAM_FMTS                     0x0B
 #define CODEC_PARAM_SUPP_STREAM_FMTS_PCM                 (1 << 0)
@@ -959,20 +991,27 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
     // format (Linux HDA likes to configure stereo streams even for mono
     // content, doubling the true byte rate). Deriving from fmt is the
     // only way to be robust across guest driver choices.
-    uint16_t fmt             = stream->fmt;
-    uint32_t channels        = (fmt & 0xF) + 1;
-    uint32_t bits_code       = (fmt >> 4) & 7;
-    uint32_t bits_per_sample = bits_code == 0 ? 8  : bits_code == 1 ? 16 :
-                               bits_code == 2 ? 20 : bits_code == 3 ? 24 : 32;
-    uint32_t bytes_per_frame = channels * ((bits_per_sample + 7) / 8);
-    uint32_t div             = ((fmt >> 8)  & 7) + 1;
-    uint32_t mult            = ((fmt >> 11) & 7) + 1;
-    uint32_t base_hz         = (fmt & (1 << 14)) ? 44100 : 48000;
-    uint64_t sample_rate_hz  = (uint64_t)base_hz * mult / div;
+    uint16_t fmt              = stream->fmt;
+    uint32_t channels         = (fmt & 0xF) + 1;
+    uint32_t bytes_per_sample = hda_fmt_container_bytes[(fmt >> 4) & 7];
+    uint32_t mult_code        = (fmt >> 11) & 7;
+    uint32_t div              = ((fmt >> 8) & 7) + 1;
+    uint32_t base_hz          = (fmt & (1u << 14)) ? 44100 : 48000;
+    // Reject formats the spec marks reserved or that we don't render:
+    //   - bit 15 TYPE=1 (Non-PCM): codec advertises PCM only
+    //   - BITS code 5..7: container size 0 in the lookup table
+    //   - MULT code 4..7: spec 3.3.41 / 3.7.1 reserved
+    // Folded into the same bail-and-let-guest-retry path as fmt=0 below.
+    bool fmt_valid = (fmt & (1u << 15)) == 0
+                  && bytes_per_sample != 0
+                  && mult_code <= 3;
+    uint64_t sample_rate_hz = (uint64_t)base_hz * (mult_code + 1) / div;
+    uint32_t bytes_per_frame = channels * bytes_per_sample;
     uint64_t SAMPLE_RATE_BYTES_PER_SEC = sample_rate_hz * bytes_per_frame;
-    if (SAMPLE_RATE_BYTES_PER_SEC == 0) {
-        // Guest wrote run=1 before configuring the format. Bail out
-        // like the NULL-dma case — driver will retry properly.
+    if (!fmt_valid || SAMPLE_RATE_BYTES_PER_SEC == 0) {
+        // Guest wrote run=1 before configuring the format, or programmed
+        // an encoding the spec marks reserved. Bail like the NULL-dma
+        // case — driver will retry properly.
         atomic_store_uint32_relax(&stream->running, 0);
         return;
     }
@@ -1022,7 +1061,7 @@ static void sound_hda_stream_drain(sound_hda_dev_t *hda)
                     // LPIB keeps moving and the guest can recover.
                 } else if (channels == 1) {
                     hda->subsystem.write(&hda->subsystem, pcm, len);
-                } else if (bits_per_sample == 16) {
+                } else if (bytes_per_sample == 2) {
                     // Common case: 16-bit multi-channel → 16-bit mono.
                     // Stack-allocate — BDL entries are small (256-4096 B).
                     size_t frame_bytes_in = (size_t)bytes_per_frame;
