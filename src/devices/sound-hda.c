@@ -1329,7 +1329,15 @@ static uint32_t sound_hda_codec_fg_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_SUB_NODE_COUNT:
-            return 0x00030002; // 3 Subnodes (NIDs 2, 3, 4) starting at NID 2
+            // §7.3.4.3 format: (starting_nid << 16) | count.
+            //   bits 23:16 = starting NID, bits 7:0 = total count.
+            // 3 subnodes (NIDs 2, 3, 4) starting at NID 2 → 0x00020003.
+            // (Bug history: the Beep widget commit a2a4255 swapped the
+            // bytes here as 0x00030002 — "starting NID 3, count 2" —
+            // which made Linux iterate NIDs 3, 4 only and miss NID 2
+            // entirely. Codec dump showed no Node 0x02; autoconfig
+            // found pin 0x03 with no converter; PCM creation failed.)
+            return 0x00020003;
 
         case CODEC_PARAM_FUNC_GROUP_TYPE:
             return CODEC_PARAM_FUNC_GROUP_TYPE_AUDIO;
