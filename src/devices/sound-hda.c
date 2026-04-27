@@ -855,16 +855,27 @@ static void sound_hda_write_rirb(sound_hda_dev_t *hda, uint32_t cad, uint32_t re
     ++hda->rirb_wp;
     hda->rirb_wp %= hda->rirb_size;
 
+    // Each RIRB entry is 8 bytes (HDA spec §3.3.27 / §4.4.2.1: response
+    // dword + response_ex dword). Map the entry, then store the two
+    // dwords at indices 0 and 1.
+    //
+    // Earlier this used `rirb_lo + rirb_wp*4` for the base (treating WP
+    // as a dword index) and then indexed `rirb[rirb_wp]` and
+    // `rirb[rirb_wp+1]` (treating WP again, this time as a dword
+    // offset on top of the already-shifted base) — two compounding
+    // errors that landed at `rirb_lo + rirb_wp*8` *only* because the
+    // host returned a pointer to a mapping wider than the 4 bytes
+    // requested. Strict bounds checking, or a RIRB allocated with a
+    // page boundary mid-ring, broke it.
     uint32_t *rirb = pci_get_dma_ptr(
         hda->pci_func,
-        (rvvm_addr_t) hda->rirb_lo + hda->rirb_wp * 4,
-        4
+        (rvvm_addr_t)hda->rirb_lo + hda->rirb_wp * 8,
+        8
     );
+    if (rirb == NULL) return;
 
-    uint32_t response_ex = cad;
-
-    rirb[hda->rirb_wp] = response;
-    rirb[hda->rirb_wp + 1] = response_ex;
+    rirb[0] = response;
+    rirb[1] = cad;       // response_ex (codec address in bits 3:0)
     pci_send_irq(hda->pci_func, 0);
 }
 
@@ -873,7 +884,11 @@ static uint32_t sound_hda_codec_root_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_VENDOR_ID:
-            return SOUND_DEVICE_ID_CMEDIA;
+            // HDA spec §7.3.4.1: bits 31:16 = Vendor ID, 15:0 = Device
+            // ID. Returning just the device ID left vendor=0 — Linux's
+            // generic codec path still bound, but any driver that
+            // matches on vendor (or logs it for diagnostics) saw 0x0000.
+            return ((uint32_t)SOUND_VENDOR_ID_CMEDIA << 16) | SOUND_DEVICE_ID_CMEDIA;
 
         case CODEC_PARAM_REVISION_ID:
             return 0xFFFF;
@@ -938,7 +953,11 @@ static uint32_t sound_hda_codec_output_cmd(uint32_t payload)
 {
     switch (payload) {
         case CODEC_PARAM_VENDOR_ID:
-            return SOUND_DEVICE_ID_CMEDIA;
+            // HDA spec §7.3.4.1: bits 31:16 = Vendor ID, 15:0 = Device
+            // ID. Returning just the device ID left vendor=0 — Linux's
+            // generic codec path still bound, but any driver that
+            // matches on vendor (or logs it for diagnostics) saw 0x0000.
+            return ((uint32_t)SOUND_VENDOR_ID_CMEDIA << 16) | SOUND_DEVICE_ID_CMEDIA;
 
         case CODEC_PARAM_REVISION_ID:
             return 0xFFFF;
@@ -1214,7 +1233,17 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
     uint64_t       paced_bytes_out = 0;
 
     uint32_t total = stream->bdl_lvi + 1;
-    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, stream->bdl_len);
+    // Map the BDL itself, not the audio data it points to. Each BDL
+    // entry is 16 bytes (HDA spec §3.6.3: 8-byte address + 4-byte
+    // length + 4-byte flags), so the total BDL byte size is
+    // (lvi+1)*16. Earlier this passed `stream->bdl_len` (which is the
+    // SDnCBL audio data total — often 64–256 KB) — pci_get_dma_ptr's
+    // forgiving range handling let it work in practice, but a strict
+    // bounds check or a BDL allocated near the edge of its mapping
+    // would land us reading past the end of the BDL into adjacent
+    // (or unmapped) guest memory.
+    uint64_t bdl_bytes = (uint64_t)total * 16;
+    uint64_t *dma = pci_get_dma_ptr(hda->pci_func, stream->bdl_lo, bdl_bytes);
 
     // If the guest set up the stream control register without a valid BDL
     // (bdl_lo == 0 or invalid), pci_get_dma_ptr returns NULL. Bail out
