@@ -874,8 +874,22 @@ static void gr_corb_wp_write(sound_hda_dev_t *hda, uint32_t v)
 
 static void gr_corb_rp_write(sound_hda_dev_t *hda, uint32_t v)
 {
-    // §3.3.21: bit 15 self-clears RP.
-    hda->corb_rp = (v & 0x8000u) ? 0u : (v & 0x7Fu);
+    // §3.3.21: bit 15 self-clears RP. Spec also requires CORBCTL.CORBRUN
+    // to be 0 before resetting RP — "or else DMA transfer may be
+    // corrupted." Our CORB consumer runs synchronously under hda->lock
+    // so there's no real corruption window, but a guest that violates
+    // this (writes RP reset while CORBRUN=1) is bug-checking against
+    // spec-conformant hardware, so silently ignore the reset to match.
+    if (v & 0x8000u) {
+        if (hda->corbctl & 0x2u) {
+            DO_ONCE(rvvm_debug("sound-hda: CORB_RP reset requested with"
+                               " CORBRUN=1; ignored per §3.3.21"));
+            return;
+        }
+        hda->corb_rp = 0;
+    } else {
+        hda->corb_rp = v & 0x7Fu;
+    }
 }
 
 static const uint32_t hda_corb_sizes[4] = { 8,  64, 1024, 0 };
@@ -933,6 +947,23 @@ static void gr_corbsts_write(sound_hda_dev_t *hda, uint32_t v)
 {
     // §3.3.23: bit 0 CMEI is RW1C. We never raise CORB memory errors.
     hda->corbsts &= ~(v & 0x1u);
+}
+
+// §3.4.1: "Software must ensure that the ICB bit in the Immediate
+// Command Status register is clear before writing a value into [ICW]
+// or undefined behavior will result." Our model dispatches synchronously
+// under hda->lock so the bad state is unreachable in practice — but a
+// guest that violates this is bug-checking against compliant hardware,
+// so we log it as a diagnostic and accept the write anyway (matches the
+// "may produce undefined results" wording: a deterministic outcome
+// either way is fine).
+static void gr_icw_write(sound_hda_dev_t *hda, uint32_t v)
+{
+    if (hda->ics & 0x1u) {
+        DO_ONCE(rvvm_debug("sound-hda: ICW written with ICS.ICB=1; "
+                           "spec §3.4.1 prohibits this"));
+    }
+    hda->icw = v;
 }
 
 // §3.4 Immediate Command Interface — PIO-style alternative to CORB/RIRB.
@@ -1012,7 +1043,7 @@ static const gr_reg_t gr_regs[] = {
     GR_RW(SOUND_HDA_RIRB_CTRL,          1, rirbctl),
     GR_ACTION(SOUND_HDA_RIRB_STATUS,    1, rirb_status, NULL, gr_rirb_status_write,  "RIRBSTS"   ),
     GR_ACTION(SOUND_HDA_RIRB_SIZE,      1, rirb_size, gr_rirb_size_read, gr_rirb_size_write, "RIRBSIZE"),
-    GR_RW(SOUND_HDA_ICW,                4, icw),
+    GR_ACTION(SOUND_HDA_ICW,            4, icw,      NULL, gr_icw_write,             "ICW"       ),
     GR_RW(SOUND_HDA_IRR,                4, irr),
     GR_ACTION(SOUND_HDA_ICS,            2, ics,      NULL, gr_ics_write,             "ICS"       ),
     GR_RW(SOUND_HDA_DMA_LO,             4, dplbase),
@@ -1734,6 +1765,17 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
         atomic_store_uint32_relax(&stream->running, 0);
         return;
     }
+    // §3.3.38: "CBL must represent an integer number of samples." Not
+    // enforced by us (we don't know FMT at CBL write time, and rejecting
+    // would silently break the stream), but log it so guest bugs are
+    // visible. LPIB will wrap mid-sample and the guest's hw_ptr math
+    // will drift; that's the guest's fault.
+    if (stream->bdl_len % bytes_per_frame != 0) {
+        DO_ONCE(rvvm_debug("sound-hda: SDnCBL=%u not a multiple of frame size"
+                           " %u (channels=%u, bytes/sample=%u) — spec §3.3.38",
+                           stream->bdl_len, bytes_per_frame,
+                           channels, bytes_per_sample));
+    }
     uint64_t       paced_start_ns  = 0;
     uint64_t       paced_bytes_out = 0;
 
@@ -1765,6 +1807,29 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
             uint64_t addr = bdle[0];
             uint32_t len  = bdle[1] & 0xFFFFFFFF;
             uint8_t  ioc  = bdle[1] >> 32 & 1;
+
+            // §3.6.3: "The buffer length must be at least one Word."
+            // A zero-length entry is a guest spec violation. Skip the
+            // backend write (avoids degenerate snd_pcm_writei(buf, 0)
+            // calls) but still latch IOC and advance LPIB by 0 so the
+            // guest's bookkeeping isn't disturbed.
+            if (len == 0) {
+                DO_ONCE(rvvm_debug("sound-hda: zero-length BDL entry at idx %u"
+                                   " — spec §3.6.3", i));
+                if (!atomic_load_uint32_relax(&stream->running)) return;
+                if (ioc) {
+                    spin_lock(&hda->lock);
+                    stream->status |= 0x04;
+                    uint8_t  ioce = stream->ioce;
+                    uint32_t ic   = hda->intr_ctrl;
+                    spin_unlock(&hda->lock);
+                    if (ioce && (ic & (1u << 31))
+                             && (ic & (1u << stream->intsts_bit))) {
+                        pci_send_irq(hda->pci_func, 0);
+                    }
+                }
+                continue;
+            }
 
             // Dispatch PCM to the configured host-side backend. If no backend
             // was installed at init time (neither a compile-time USE_ALSA nor
