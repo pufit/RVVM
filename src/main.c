@@ -35,7 +35,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/i2c-oc.h"
 #include "devices/ns16550a.h"
 #include "devices/nvme.h"
+#include "devices/parport-pci.h"
 #include "devices/pci-bus.h"
+
+#include <stdio.h>  // Used unconditionally by parport_main_write_fn below.
 #include "devices/pci-vfio.h"
 #include "devices/riscv-aclint.h"
 #include "devices/riscv-aplic.h"
@@ -197,6 +200,8 @@ static void rvvm_print_help(void)
         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
         "    -nogui           Disable display GUI\n"
         "    -nosound         Disable sound support\n"
+        "    -parport_test    Attach an emulated NetMos 9900 PCI parallel port\n"
+        "    -parport_out ... File to receive parport output (default: /tmp/rvvm-parport0.out)\n"
         "    -nonet           Disable networking\n"
         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
         "    -dtb        ...  Pass custom Device Tree Blob to the machine\n"
@@ -208,6 +213,16 @@ static void rvvm_print_help(void)
         "    -nojit           Disable RVJIT (For debug purposes, slow!)\n"
         "\n";
     print_stderr(help);
+}
+
+// Bridge for the -parport_test default backend: each strobed byte from the
+// guest's parallel port is appended to a host file. user_data carries the
+// FILE* opened in rvvm_cli_configure. Called outside the device's lock so
+// the write may safely block briefly.
+static void parport_main_write_fn(void* user_data, uint8_t byte)
+{
+    FILE* fp = (FILE*)user_data;
+    if (fp) fputc(byte, fp);
 }
 
 static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_dev_t* tap)
@@ -370,6 +385,23 @@ static int rvvm_cli_main(int argc, char** argv)
 
     if (rvvm_has_arg("hda_test")) {
         sound_hda_init_auto(machine);
+    }
+
+    if (rvvm_has_arg("parport_test")) {
+        // Default backend writes guest parport output to a host file.
+        // Override path with -parport_out <path>; /dev/stdout dumps to
+        // the controlling terminal.
+        const char* path = rvvm_getarg("parport_out");
+        if (path == NULL) path = "/tmp/rvvm-parport0.out";
+        FILE* fp = fopen(path, "wb");
+        if (fp) {
+            setvbuf(fp, NULL, _IONBF, 0);  // unbuffered — bytes appear immediately
+            rvvm_info("parport: writes go to %s", path);
+            parport_pci_init_auto(machine, parport_main_write_fn, fp);
+        } else {
+            rvvm_warn("parport: failed to open %s, attaching with no backend", path);
+            parport_pci_init_auto(machine, NULL, NULL);
+        }
     }
 
     tap_dev_t* tap = NULL;
