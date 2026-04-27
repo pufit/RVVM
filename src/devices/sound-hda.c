@@ -333,6 +333,35 @@ static const uint8_t hda_fmt_container_bytes[8] = {
 #undef HDA_BITS_BYTES_INIT
 };
 
+// HDA gain step → Q15 amplitude factor. Our codec advertises
+// CODEC_PARAM_OUTPUT_AMP_CAPS_STEPSIZE=3 (encoded "(N+1)*0.25 dB" → 1.0
+// dB per step), NUMSTEPS=74, OFFSET=74 (HDA spec §7.3.4.10), so
+// step=74 → 0 dB and step=0 → -74 dB. Convert without libm: factor a
+// dB attenuation as `floor(atten/6)` halvings (each 6 dB ≈ ÷2) plus a
+// 6-entry mantissa table for the 0..5 dB residue.
+//
+// Accuracy is within ~0.5 dB of `pow(10, -atten/20)` across the full
+// range — well below the user's perceptual threshold (~1 dB), and
+// fixed-point so it works whether USE_FPU is enabled or not.
+static const uint16_t hda_gain_db_mantissa[6] = {
+    32768, // -0 dB → 1.000
+    29205, // -1 dB → 0.891
+    26029, // -2 dB → 0.794
+    23197, // -3 dB → 0.708
+    20675, // -4 dB → 0.631
+    18430, // -5 dB → 0.562
+};
+
+static int32_t hda_gain_to_q15(uint8_t gain, uint8_t mute)
+{
+    if (mute)        return 0;
+    if (gain >= 74)  return 32768;        // 0 dB or above (clamp)
+    int atten = 74 - (int)gain;
+    int shift = atten / 6;
+    int rem   = atten % 6;
+    return (int32_t)hda_gain_db_mantissa[rem] >> shift;
+}
+
 // Sized MMIO load/store. Use these in every register handler instead of
 // bare read_uint{8,16,32}_le — they respect the access width the bus
 // reports, so 1-byte writes to a 4-byte register don't pull garbage from
@@ -464,6 +493,16 @@ typedef struct {
     uint8_t     right_gain;
     uint8_t     left_mute;
     uint8_t     right_mute;
+    int32_t     gain_q15;      // Cached amplitude factor for the worker.
+                               // Q15 fixed point: 32768 = unity (0 dB),
+                               // 0 = full mute. Recomputed in
+                               // VERB_SET_AMP_GAIN_MUTE; default unity
+                               // (codec power-on per HDA spec §7.3.3.7
+                               // is "Gain field defaults to Offset" =
+                               // 0 dB). Worker reads lockless — torn
+                               // 32-bit reads are aligned/atomic on
+                               // x86/arm64 and a stale value across one
+                               // chunk is inaudible.
 } sound_hda_stream_t;
 
 struct sound_hda_dev_s {
@@ -1079,6 +1118,14 @@ static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t 
                     stream->right_mute = mute;
                     stream->right_gain = gain;
                 }
+                // Recompute the worker's amplitude factor. Codec is
+                // mono-advertised (no STEREO bit on NID 2 caps), so
+                // the output is driven by the left channel per spec
+                // §7.3.3.7 ("if the widget only supports a single
+                // channel, [Right is] ignored and the value programmed
+                // applies to the left").
+                stream->gain_q15 = hda_gain_to_q15(stream->left_gain,
+                                                   stream->left_mute);
             }
             break;
         }
@@ -1192,10 +1239,20 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                 s->fmt        = 0;
                 s->channel    = 0;
                 s->stream     = 0;
-                s->left_gain  = 0;
-                s->right_gain = 0;
+                // Spec §7.3.3.7: "After codec reset, this 'Gain' field
+                // must default to the 'Offset' value, meaning that all
+                // amplifiers, by default, are configured to 0 dB gain."
+                // Our advertised Offset is 0x4A = 74. Default mute=0
+                // (unmuted) — spec recommends mute=1 generally, but
+                // there's no beep pin, no jack-detect amp interaction,
+                // and Linux's HDA generic codec unmutes during widget
+                // power-up anyway; defaulting unmuted matches the
+                // historical behaviour where the worker ignored mute.
+                s->left_gain  = 0x4A;
+                s->right_gain = 0x4A;
                 s->left_mute  = 0;
                 s->right_mute = 0;
+                s->gain_q15   = 32768;  // unity (0 dB)
             }
             response = 0;
             break;
@@ -1325,10 +1382,34 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
                     // memcpy from NULL. Pacing still advances below so
                     // LPIB keeps moving and the guest can recover.
                 } else if (channels == 1) {
-                    hda->subsystem.write(&hda->subsystem, pcm, len);
+                    // Mono fast path — but we still need to apply the
+                    // codec amp's gain/mute (HDA spec §7.3.3.7).
+                    // Q15 multiply per sample; unity (32768) skips the
+                    // copy and writes the guest buffer directly.
+                    int32_t q15 = stream->gain_q15;
+                    if (q15 == 32768) {
+                        hda->subsystem.write(&hda->subsystem, pcm, len);
+                    } else {
+                        size_t frames = len / 2;            // 16-bit mono
+                        int16_t *src = (int16_t*)pcm;
+                        int16_t  scaled[4096];
+                        size_t emitted = 0;
+                        while (emitted < frames) {
+                            size_t chunk = frames - emitted;
+                            if (chunk > 4096) chunk = 4096;
+                            for (size_t f = 0; f < chunk; f++) {
+                                scaled[f] = (int16_t)(((int32_t)src[emitted + f] * q15) >> 15);
+                            }
+                            hda->subsystem.write(&hda->subsystem, scaled, chunk * 2);
+                            emitted += chunk;
+                        }
+                    }
                 } else if (bytes_per_sample == 2) {
                     // Common case: 16-bit multi-channel → 16-bit mono.
                     // Stack-allocate — BDL entries are small (256-4096 B).
+                    // Apply the codec amp gain during the channel
+                    // averaging — saves a second pass over the buffer.
+                    int32_t q15           = stream->gain_q15;
                     size_t frame_bytes_in = (size_t)bytes_per_frame;
                     size_t frames         = len / frame_bytes_in;
                     int16_t *src = (int16_t*)pcm;
@@ -1343,7 +1424,8 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
                             for (uint32_t c = 0; c < channels; c++) {
                                 sum += src[base + c];
                             }
-                            mono_buf[f] = (int16_t)(sum / (int32_t)channels);
+                            int32_t mono = sum / (int32_t)channels;
+                            mono_buf[f] = (int16_t)((mono * q15) >> 15);
                         }
                         hda->subsystem.write(&hda->subsystem, mono_buf, chunk_frames * 2);
                         bytes_emitted += chunk_frames * 2;
@@ -1712,6 +1794,11 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
         } else {
             s->dir = HDA_STREAM_DIR_BIDIR;
         }
+        // Spec §7.3.3.7: amp gain defaults to Offset (0 dB), unmuted.
+        // Set the cached worker factor to unity to match.
+        s->left_gain  = 0x4A;
+        s->right_gain = 0x4A;
+        s->gain_q15   = 32768;
     }
 
     pci_func_desc_t sound_hda_desc = {
