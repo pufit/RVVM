@@ -854,6 +854,14 @@ static void gr_gctl_write(sound_hda_dev_t *hda, uint32_t v)
     } else if (!(prev & 1u) && (v & 1u)) {
         hda->statests |= 0x0001u;   // codec on SDIN[0]
     }
+    // FCNTRL 0→1 (bit 1): DMA position buffer flush request (§3.3.7).
+    // Spec: "The flush is complete when Flush Status is set." We have
+    // no real DMA pipeline to flush, so complete the handshake
+    // immediately by setting GSTS.FSTS — without this a guest that
+    // does the flush dance (e.g. before suspend) would hang polling.
+    if (!(prev & 0x2u) && (v & 0x2u)) {
+        hda->gsts |= 0x2u;          // FSTS
+    }
 }
 
 static uint32_t gr_intsts_read(sound_hda_dev_t *hda)  { return sound_hda_compute_intsts(hda); }
