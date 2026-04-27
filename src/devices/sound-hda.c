@@ -109,12 +109,12 @@ PUSH_OPTIMIZATION_SIZE
 #define VERB_GET_AMP_GAIN_MUTE_LEFT                      0x2000
 
 #define VERB_SET_AMP_GAIN_MUTE                           0x3
-#define VERB_SET_AMP_GAIN_MUTE_MUTE                      0x80
-#define VERB_SET_AMP_GAIN_MUTE_GAIN_MASK                 0x7
-#define VERB_SET_AMP_GAIN_MUTE_OUTPUT                    0x8000
-#define VERB_SET_AMP_GAIN_MUTE_INPUT                     0x4000
-#define VERB_SET_AMP_GAIN_MUTE_LEFT                      0x2000
-#define VERB_SET_AMP_GAIN_MUTE_RIGHT                     0x1000
+#define VERB_SET_AMP_GAIN_MUTE_MUTE                      0x80   // Payload bit 7
+#define VERB_SET_AMP_GAIN_MUTE_GAIN_MASK                 0x7F   // Payload bits 6:0
+#define VERB_SET_AMP_GAIN_MUTE_OUTPUT                    0x8000 // Bit 15: Set Output Amp
+#define VERB_SET_AMP_GAIN_MUTE_INPUT                     0x4000 // Bit 14: Set Input Amp
+#define VERB_SET_AMP_GAIN_MUTE_LEFT                      0x2000 // Bit 13: Set Left  (channel 0)
+#define VERB_SET_AMP_GAIN_MUTE_RIGHT                     0x1000 // Bit 12: Set Right (channel 1)
 
 #define VERB_GET_CONV_FMT                                0xA
 #define VERB_SET_CONV_FMT                                0x2
@@ -1031,8 +1031,6 @@ static uint32_t sound_hda_codec_pin_output_cmd(uint32_t payload)
 static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t nid, uint32_t verb, uint32_t payload)
 {
     uint32_t response = 0;
-    uint8_t  mute = 0;
-    uint8_t  gain = 0;
 
     switch (verb) {
         case VERB_GET_CONV_FMT:
@@ -1041,31 +1039,49 @@ static uint32_t sound_hda_codec_stream_cmd(sound_hda_stream_t *stream, uint32_t 
         case VERB_SET_CONV_FMT:
             stream->fmt = payload;
             break;
-        case VERB_GET_AMP_GAIN_MUTE:
-            if (payload & VERB_GET_AMP_GAIN_MUTE_LEFT) {
-                response = stream->left_gain | stream->left_mute;
-            }
-
-            if (payload & VERB_GET_AMP_GAIN_MUTE_RIGHT) {
-                response = stream->right_gain | stream->right_mute;
-            }
-
+        case VERB_GET_AMP_GAIN_MUTE: {
+            // HDA spec §7.3.3.7 Get payload (Figure 62): bit 13 selects
+            // left (1) vs right (0) channel; bit 15 selects output (1)
+            // vs input (0). Our codec advertises output amps only, so
+            // bit 15 doesn't change which side we read.
+            //
+            // Earlier this used `payload & VERB_GET_AMP_GAIN_MUTE_RIGHT`
+            // (== `& 0`) which is always false, so right-channel reads
+            // returned 0 unconditionally. ALSA's mixer state for the
+            // right channel was a permanent 0 / mute regardless of what
+            // the guest had set.
+            bool left = (payload & VERB_GET_AMP_GAIN_MUTE_LEFT) != 0;
+            uint8_t mute = left ? stream->left_mute : stream->right_mute;
+            uint8_t gain = left ? stream->left_gain : stream->right_gain;
+            // Get response (Figure 63): bit 7 mute, bits 6:0 gain.
+            response = ((uint32_t)(mute & 1u) << 7) | (gain & 0x7Fu);
             break;
-        case VERB_SET_AMP_GAIN_MUTE:
-            mute = VERB_SET_AMP_GAIN_MUTE_MUTE;
-            gain = VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
-
-            if (payload & VERB_SET_AMP_GAIN_MUTE_LEFT) {
-                stream->left_mute = mute;
-                stream->left_gain = gain;
+        }
+        case VERB_SET_AMP_GAIN_MUTE: {
+            // HDA spec §7.3.3.7 Set payload (Figure 64): bit 15 Set
+            // Output, 14 Set Input, 13 Set Left, 12 Set Right, 7 Mute,
+            // 6:0 Gain. Earlier this stored fixed mask constants
+            // (`0x80` mute, `0x07` gain) regardless of payload — every
+            // guest write left mute=on and gain=7 forever; ALSA volume
+            // controls were dead.
+            //
+            // Codec advertises output amps only — Set Input bit is a
+            // no-op for us. Spec also says: "if neither Set Left nor
+            // Set Right is set, the command is effectively a no-op."
+            if (payload & VERB_SET_AMP_GAIN_MUTE_OUTPUT) {
+                uint8_t mute = (payload & VERB_SET_AMP_GAIN_MUTE_MUTE) ? 1u : 0u;
+                uint8_t gain = payload & VERB_SET_AMP_GAIN_MUTE_GAIN_MASK;
+                if (payload & VERB_SET_AMP_GAIN_MUTE_LEFT) {
+                    stream->left_mute = mute;
+                    stream->left_gain = gain;
+                }
+                if (payload & VERB_SET_AMP_GAIN_MUTE_RIGHT) {
+                    stream->right_mute = mute;
+                    stream->right_gain = gain;
+                }
             }
-
-            if (payload & VERB_SET_AMP_GAIN_MUTE_RIGHT) {
-                stream->right_mute = mute;
-                stream->right_gain = gain;
-            }
-
             break;
+        }
         case VERB_GET_CONV_STREAM_CHAN:
             response = (stream->stream << 4) | stream->channel;
             break;
