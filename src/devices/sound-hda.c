@@ -1273,17 +1273,16 @@ static void sound_hda_codec_cmd(sound_hda_dev_t *hda, uint32_t cmd)
                 // Spec §7.3.3.7: "After codec reset, this 'Gain' field
                 // must default to the 'Offset' value, meaning that all
                 // amplifiers, by default, are configured to 0 dB gain."
-                // Default mute=0 (unmuted). Spec recommends mute=1
-                // generally, but there's no beep pin, no jack-detect amp
-                // interaction, and Linux's HDA generic codec unmutes
-                // during widget power-up anyway; defaulting unmuted
-                // matches the historical behaviour where the worker
-                // ignored mute.
+                // Spec §7.3.3.7: gain defaults to Offset (0 dB), mute
+                // "should default to 1 on codec reset." Linux's HDA
+                // generic codec unmutes primary output paths during the
+                // post-reset re-probe; matches our power-on default in
+                // sound_hda_init_ex.
                 s->left_gain  = HDA_AMP_OFFSET;
                 s->right_gain = HDA_AMP_OFFSET;
-                s->left_mute  = 0;
-                s->right_mute = 0;
-                s->gain_q15   = 32768;  // unity (0 dB)
+                s->left_mute  = 1;
+                s->right_mute = 1;
+                s->gain_q15   = 0;
             }
             response = 0;
             break;
@@ -1825,11 +1824,18 @@ PUBLIC pci_dev_t *sound_hda_init_ex(pci_bus_t *pci_bus,
         } else {
             s->dir = HDA_STREAM_DIR_BIDIR;
         }
-        // Spec §7.3.3.7: amp gain defaults to Offset (0 dB), unmuted.
-        // Set the cached worker factor to unity to match.
+        // Spec §7.3.3.7: amp gain defaults to Offset (0 dB), and mute
+        // "should default to 1 on codec reset." Linux's HDA generic
+        // codec unmutes primary output paths during probe via
+        // SET_AMP_GAIN_MUTE; the ScalarEvolution rootfs's
+        // /etc/local.d/scev-sound.start is the userspace safety net
+        // that unmutes + alsactl-stores on first boot. Cache q15=0 so
+        // the worker treats the pre-probe state as silent.
         s->left_gain  = HDA_AMP_OFFSET;
         s->right_gain = HDA_AMP_OFFSET;
-        s->gain_q15   = 32768;
+        s->left_mute  = 1;
+        s->right_mute = 1;
+        s->gain_q15   = 0;
     }
 
     pci_func_desc_t sound_hda_desc = {
