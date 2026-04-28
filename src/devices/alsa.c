@@ -79,6 +79,11 @@ typedef struct {
     snd_pcm_t *pcm_playback;
     snd_pcm_t *pcm_capture;     // NULL if capture device couldn't be opened
 
+    // Currently-open playback rate. Tracked so set_rate can dedupe
+    // calls with the same rate (no-op vs. tear down + reopen).
+    // Updated by alsa_open_playback after a successful open.
+    unsigned int playback_rate;
+
     // Set by alsa_sound_abort() when the HDA device is being removed.
     // alsa_sound_write() checks this on every iteration so a blocked
     // writei that abort has unblocked (via snd_pcm_drop) does not loop
@@ -224,6 +229,15 @@ static void alsa_sound_write(sound_subsystem_t *subsystem, void *data, size_t si
     // always feed mono 16-bit, so one frame = 2 bytes. Bail on
     // unrecoverable errors after a handful of retries so a disconnected
     // device doesn't spin us forever.
+    // Playback PCM is opened lazily by set_rate on the first chunk
+    // after the guest configures SDnFMT. If we get write() before
+    // that — guest started a stream with fmt=0 and we bailed in
+    // sound_hda_stream_drain, or fmt=0 was tolerated by the worker —
+    // there's nothing to write into. Drop silently; the stream
+    // worker keeps pacing LPIB so the guest's bookkeeping stays
+    // consistent.
+    if (alsa->pcm_playback == NULL) return;
+
     int16_t *buf = (int16_t*)data;
     snd_pcm_uframes_t remaining = size / 2;
     int xrun_retries = 4;
@@ -313,28 +327,34 @@ do { \
     return avail;
 }
 
-bool alsa_sound_init(sound_subsystem_t *sound)
+// Open (or reopen) the playback PCM at the requested rate. Closes any
+// previously-open playback PCM first. Used by alsa_sound_init for the
+// initial open at 48 kHz, and by alsa_sound_set_rate when the guest
+// reconfigures its stream to a different rate (44.1 kHz from a
+// retro-emulator core, etc.).
+//
+// Idempotent on rate: a same-rate call still tears down and reopens —
+// callers should dedupe via subsystem->playback_rate. Returns false
+// and leaves pcm_playback NULL if open or hw_params fails.
+//
+// Thread safety: caller must guarantee no concurrent write() — the
+// stream worker is the only writer and the only set_rate caller, so
+// they're naturally serialised on the same thread.
+static bool alsa_open_playback(alsa_subsystem_t *subsystem, unsigned int sample_rate)
 {
-    bool libasound_avail = true;
-    DO_ONCE(libasound_avail = alsa_load_symbols());
-    if (!libasound_avail) {
-        rvvm_error("Could not load libasound.so");
-        return false;
+    if (subsystem->pcm_playback != NULL) {
+        snd_pcm_close(subsystem->pcm_playback);
+        subsystem->pcm_playback = NULL;
+        subsystem->playback_rate = 0;
     }
 
-    alsa_subsystem_t *subsystem = safe_new_obj(alsa_subsystem_t);
-    if (snd_pcm_open(&subsystem->pcm_playback, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
+    snd_pcm_t *pcm_device = NULL;
+    if (snd_pcm_open(&pcm_device, "default", SND_PCM_STREAM_PLAYBACK, 0) < 0) {
         rvvm_warn("Failed to open ALSA device");
         return false;
     }
 
-    snd_pcm_t *pcm_device = subsystem->pcm_playback;
     snd_pcm_hw_params_t *params = NULL;
-    // Match the HDA codec's advertised format (48 kHz mono 16-bit in
-    // sound-hda.c's CODEC_PARAM_SUPP_PCM_SIZE_RATES). Opening the host
-    // PCM at 192 kHz while the codec feeds 48 kHz streams plays audio
-    // 4× fast → two octaves up.
-    unsigned int sample_rate = 48000;
     int channels = 1;
     // Host PCM latency. The guest runs its own ALSA buffer on top of the
     // emulated HDA DMA BDL — that's what user-space apps size via
@@ -345,7 +365,9 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     // xruns PipeWire and mpg123's write returns short (3400 of 4608) as
     // back-pressure propagates. 960-frame periods (20 ms) with a 4×
     // buffer (80 ms total) give PipeWire enough slack to ride out jitter
-    // without noticeable user-facing latency.
+    // without noticeable user-facing latency. Period size is in frames
+    // and stays constant across rates — at 44.1 kHz, 960 frames is
+    // ~21.8 ms which is still well within the slack budget.
     snd_pcm_uframes_t period_frames = 960;
     snd_pcm_uframes_t buffer_frames = 3840;
     int dir = 0;
@@ -360,6 +382,7 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     snd_pcm_hw_params_set_period_size_near(pcm_device, params, &period_frames, &dir);
     snd_pcm_hw_params_set_buffer_size_near(pcm_device, params, &buffer_frames);
     snd_pcm_hw_params(pcm_device, params);
+    snd_pcm_hw_params_free(params);
 
     // Prime the host PCM with two periods of silence before any guest
     // audio shows up. PipeWire (and modern PulseAudio) finishes
@@ -369,7 +392,9 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     // priming, the very first guest period lands in a partially-set-
     // up sink and the leading 5-20 ms is dropped or fed into a
     // not-yet-running mixer, producing the audible "ta" transient at
-    // stream start that users have reported.
+    // stream start that users have reported. Same logic applies on
+    // reopen-at-new-rate: PipeWire treats the new snd_pcm_t as a
+    // fresh node.
     //
     // Two periods is the minimum that reliably absorbs the wake-up
     // cost across PipeWire and PulseAudio; one period works on
@@ -377,8 +402,60 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     int16_t silence[960 * 2 /* periods × period_frames × 1 channel */] = {0};
     snd_pcm_writei(pcm_device, silence, sizeof(silence) / sizeof(int16_t));
 
-    subsystem->pcm_playback = pcm_device;
-    snd_pcm_hw_params_free(params);
+    subsystem->pcm_playback  = pcm_device;
+    subsystem->playback_rate = sample_rate;
+
+    rvvm_info("alsa playback: rate=%u channels=%u period=%lu buffer=%lu",
+              sample_rate, channels,
+              (unsigned long)period_frames, (unsigned long)buffer_frames);
+    return true;
+}
+
+// sound_subsystem_t::set_rate — the HDA stream worker calls this from
+// its own thread when the guest configures a stream rate. Lazy first
+// open: no PCM is opened during init(), so the very first set_rate
+// (typically the guest's only one — most cores pick a rate once and
+// stick) opens the host PCM at exactly the right rate, and we never
+// need a close+reopen cycle in the common case.
+//
+// Why not eager-open at init: alsa-lib in some setups (Nix +
+// PipeWire-as-ALSA) handles snd_pcm_close → snd_pcm_open at a new
+// rate poorly — the second open fails with "Cannot access file
+// .../alsa.conf" because alsa-lib's global config state doesn't
+// fully survive the close. Deferring the first open until we know
+// the rate avoids the round-trip entirely.
+//
+// Subsequent rate changes (rare — guests don't usually swap rates
+// mid-session) DO require close+reopen. If that fails we leave
+// pcm_playback NULL and writes go silent until the guest reconfigures
+// again. Better than a stuck/wrong-rate stream.
+//
+// Thread safety: write() and set_rate() are both called from the
+// stream worker, never concurrently with each other. Capture pump
+// runs concurrently but only touches pcm_capture.
+static void alsa_sound_set_rate(sound_subsystem_t *subsystem, uint32_t rate_hz)
+{
+    alsa_subsystem_t *alsa = subsystem->sound_data;
+    if (atomic_load_uint32_relax(&alsa->aborted)) return;
+    if (alsa->playback_rate == rate_hz)         return;
+    alsa_open_playback(alsa, rate_hz);
+}
+
+bool alsa_sound_init(sound_subsystem_t *sound)
+{
+    bool libasound_avail = true;
+    DO_ONCE(libasound_avail = alsa_load_symbols());
+    if (!libasound_avail) {
+        rvvm_error("Could not load libasound.so");
+        return false;
+    }
+
+    alsa_subsystem_t *subsystem = safe_new_obj(alsa_subsystem_t);
+    // Playback PCM is NOT opened here — see alsa_sound_set_rate. We
+    // wait for the stream worker to tell us the guest's chosen rate
+    // and open then. Result: zero host PCM impact for guests that
+    // never play audio, and one-shot open at the right rate for the
+    // common case (cores that pick a rate once at boot).
 
     // Capture path. Open the host's default capture source (PipeWire's
     // default source on modern desktops, the system mic / headset / etc.
@@ -441,9 +518,10 @@ bool alsa_sound_init(sound_subsystem_t *sound)
     }
 
     sound->sound_data = subsystem;
-    sound->write = alsa_sound_write;
-    sound->read  = alsa_sound_read;
-    sound->abort = alsa_sound_abort;
+    sound->write    = alsa_sound_write;
+    sound->read     = alsa_sound_read;
+    sound->abort    = alsa_sound_abort;
+    sound->set_rate = alsa_sound_set_rate;
 
     return true;
 }

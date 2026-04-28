@@ -1796,6 +1796,18 @@ static void sound_hda_stream_drain(sound_hda_stream_t *stream)
         atomic_store_uint32_relax(&stream->running, 0);
         return;
     }
+    // Tell the backend what rate to expect. Backends with a fixed host
+    // PCM (ALSA) reopen at the new rate; others (resampling sinks,
+    // capture-to-WAV harnesses) typically no-op. Only meaningful for
+    // output streams — the input drain doesn't talk to the playback
+    // PCM. Safe to skip for input streams since alsa's set_rate
+    // touches the playback path only, but we route by stream identity
+    // anyway to keep the contract clean: set_rate is paired with
+    // write(), not read().
+    if (stream == hda_output_stream(hda)
+            && hda->subsystem.set_rate != NULL) {
+        hda->subsystem.set_rate(&hda->subsystem, (uint32_t)sample_rate_hz);
+    }
     // §3.3.38: "CBL must represent an integer number of samples." Not
     // enforced by us (we don't know FMT at CBL write time, and rejecting
     // would silently break the stream), but log it so guest bugs are

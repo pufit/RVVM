@@ -40,6 +40,21 @@ struct sound_subsystem_t {
     // write() / read() calls are allowed to be no-ops; the worker is
     // tearing down.
     void (*abort)(sound_subsystem_t *subsystem);
+    // Optional. The HDA stream worker calls this from its own thread
+    // before write() whenever the guest's configured sample rate
+    // (parsed from SDnFMT) differs from the rate previously announced
+    // to the backend. Backends with a fixed host PCM (ALSA) should
+    // close-and-reopen at the new rate; backends that resample
+    // internally can no-op.
+    //
+    // Invoked once per drain entry; idempotent calls with the same
+    // rate must be cheap. Always paired with the existing mono /
+    // 16-bit-LE write contract — only the rate varies.
+    //
+    // NULL = stick with whatever rate was set at init(). Common case
+    // before this hook existed: 48 kHz hardcoded, which mis-paces
+    // every guest that streams at 44.1 kHz.
+    void (*set_rate)(sound_subsystem_t *subsystem, uint32_t rate_hz);
 };
 
 /*
