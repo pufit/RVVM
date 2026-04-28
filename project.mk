@@ -73,7 +73,8 @@ USE_RVV  ?= 0 # Support Vector extension
 USE_GUI     ?= 1          # Enable guest display GUI
 USE_SDL     ?= 0          # Enable SDL as GUI backend - usually picked on per-platform basis
 USE_NET     ?= 1          # Enable networking support
-USE_SOUND   ?= 0          # Enable sound support
+USE_SOUND   ?= 1          # Enable sound support
+USE_ALSA    ?= $(if $(filter linux,$(OS)),1,0) # ALSA backend (Linux host)
 USE_GDBSTUB ?= $(USE_NET) # Support debugging the guest via GDB remote protocol
 
 # Board features
@@ -150,6 +151,9 @@ override DEPS_USE_WAYLAND   := USE_GUI
 override DEPS_USE_WIN32_GUI := USE_GUI
 override DEPS_USE_HAIKU_GUI := USE_GUI
 override DEPS_USE_ALSA      := USE_SOUND
+# alsa-lib's <alsa/global.h> defines `struct timespec` unless
+# _POSIX_C_SOURCE is set, which collides with glibc's definition.
+override CFLAGS_USE_ALSA    := -D_POSIX_C_SOURCE=200809L
 override DEPS_USE_GDBSTUB   := USE_NET
 override DEPS_USE_JNI       := USE_LIB USE_NET
 override DEPS_USE_LIBRETRO  := USE_LIB USE_NET
