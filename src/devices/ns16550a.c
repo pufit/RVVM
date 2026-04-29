@@ -9,9 +9,9 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "ns16550a.h"
 #include "chardev.h"
+#include "compiler.h"
 #include "fdtlib.h"
-#include "mem_ops.h"
-#include "spinlock.h"
+#include "uart16550_core.h"
 #include "utils.h"
 
 PUSH_OPTIMIZATION_SIZE
@@ -19,132 +19,26 @@ PUSH_OPTIMIZATION_SIZE
 #define NS16550A_MMIO_SIZE 0x1000
 
 typedef struct {
-    chardev_t*   chardev;
-    rvvm_intc_t* intc;
-    rvvm_irq_t   irq;
-
-    uint32_t flags;
-    uint32_t ier;
-    uint32_t lcr;
-    uint32_t mcr;
-    uint32_t scr;
-    uint32_t dll;
-    uint32_t dlm;
+    uart16550_core_t core;
+    rvvm_intc_t*     intc;
+    rvvm_irq_t       irq;
 } ns16550a_dev_t;
 
-// Read
-#define NS16550A_REG_RBR_DLL 0x0
-#define NS16550A_REG_IIR     0x2
-// Write
-#define NS16550A_REG_THR_DLL 0x0
-#define NS16550A_REG_FCR     0x2
-// RW
-#define NS16550A_REG_IER_DLM 0x1
-#define NS16550A_REG_LCR     0x3
-#define NS16550A_REG_MCR     0x4
-#define NS16550A_REG_LSR     0x5
-#define NS16550A_REG_MSR     0x6
-#define NS16550A_REG_SCR     0x7
-
-#define NS16550A_IER_RECV    0x1
-#define NS16550A_IER_THR     0x2
-#define NS16550A_IER_LSR     0x4
-#define NS16550A_IER_MSR     0x8
-
-#define NS16550A_IIR_FIFO    0xC0
-#define NS16550A_IIR_NONE    0x1
-#define NS16550A_IIR_MSR     0x0
-#define NS16550A_IIR_THR     0x2
-#define NS16550A_IIR_RECV    0x4
-#define NS16550A_IIR_LSR     0x6
-
-#define NS16550A_LSR_RECV    0x1
-#define NS16550A_LSR_THR     0x60
-
-#define NS16550A_LCR_DLAB    0x80
-
-// Handle IIR/IER update
-static void ns16550a_update_irq(ns16550a_dev_t* uart)
+static void ns16550a_irq(void* ctx, bool level)
 {
-    uint32_t flags = atomic_load_uint32_relax(&uart->flags);
-    uint32_t ier   = atomic_load_uint32_relax(&uart->ier);
-    if (((flags & CHARDEV_RX) && (ier & NS16550A_IER_RECV)) || ((flags & CHARDEV_TX) && (ier & NS16550A_IER_THR))) {
+    ns16550a_dev_t* uart = ctx;
+    if (level) {
         rvvm_raise_irq(uart->intc, uart->irq);
     } else {
         rvvm_lower_irq(uart->intc, uart->irq);
     }
 }
 
-// Handle RX/TX chardev flags update
-static void ns16550a_notify(void* io_dev, uint32_t flags)
-{
-    ns16550a_dev_t* uart = io_dev;
-    if (atomic_swap_uint32(&uart->flags, flags) != flags) {
-        ns16550a_update_irq(uart);
-    }
-}
-
-// Poll for possible RX/TX chardev flags update
-static void ns16550a_poll(ns16550a_dev_t* uart)
-{
-    uint32_t flags = chardev_poll(uart->chardev);
-    if (flags != atomic_load_uint32_relax(&uart->flags)) {
-        ns16550a_notify(uart, flags);
-    }
-}
-
 static bool ns16550a_mmio_read(rvvm_mmio_dev_t* dev, void* data, size_t offset, uint8_t size)
 {
     ns16550a_dev_t* uart = dev->data;
-    memset(data, 0, size);
-
-    switch (offset) {
-        case NS16550A_REG_RBR_DLL:
-            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
-                write_uint8(data, atomic_load_uint32_relax(&uart->dll));
-            } else if (chardev_poll(uart->chardev) & CHARDEV_RX) {
-                chardev_read(uart->chardev, data, 1);
-                ns16550a_poll(uart);
-            }
-            break;
-        case NS16550A_REG_IER_DLM:
-            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
-                write_uint8(data, atomic_load_uint32_relax(&uart->dlm));
-            } else {
-                write_uint8(data, atomic_load_uint32_relax(&uart->ier));
-            }
-            break;
-        case NS16550A_REG_IIR: {
-            uint32_t flags = chardev_poll(uart->chardev);
-            uint32_t ier   = atomic_load_uint32_relax(&uart->ier);
-            if ((flags & CHARDEV_RX) && (ier & NS16550A_IER_RECV)) {
-                write_uint8(data, NS16550A_IIR_RECV | NS16550A_IIR_FIFO);
-            } else if ((flags & CHARDEV_TX) && (ier & NS16550A_IER_THR)) {
-                write_uint8(data, NS16550A_IIR_THR | NS16550A_IIR_FIFO);
-            } else {
-                write_uint8(data, NS16550A_IIR_NONE | NS16550A_IIR_FIFO);
-            }
-            break;
-        }
-        case NS16550A_REG_LCR:
-            write_uint8(data, atomic_load_uint32_relax(&uart->lcr));
-            break;
-        case NS16550A_REG_MCR:
-            write_uint8(data, atomic_load_uint32_relax(&uart->mcr));
-            break;
-        case NS16550A_REG_LSR: {
-            uint32_t flags = chardev_poll(uart->chardev);
-            write_uint8(data,
-                        ((flags & CHARDEV_RX) ? NS16550A_LSR_RECV : 0) | ((flags & CHARDEV_TX) ? NS16550A_LSR_THR : 0));
-            break;
-        }
-        case NS16550A_REG_MSR:
-            write_uint8(data, 0xB0);
-            break;
-        case NS16550A_REG_SCR:
-            write_uint8(data, atomic_load_uint32_relax(&uart->scr));
-            break;
-    }
+    UNUSED(size);
+    *(uint8_t*)data = uart16550_core_read(&uart->core, offset);
     return true;
 }
 
@@ -152,47 +46,20 @@ static bool ns16550a_mmio_write(rvvm_mmio_dev_t* dev, void* data, size_t offset,
 {
     ns16550a_dev_t* uart = dev->data;
     UNUSED(size);
-
-    switch (offset) {
-        case NS16550A_REG_THR_DLL:
-            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
-                atomic_store_uint32_relax(&uart->dll, read_uint8(data));
-            } else {
-                chardev_write(uart->chardev, data, 1);
-                ns16550a_poll(uart);
-            }
-            break;
-        case NS16550A_REG_IER_DLM:
-            if (atomic_load_uint32_relax(&uart->lcr) & NS16550A_LCR_DLAB) {
-                atomic_store_uint32_relax(&uart->dlm, read_uint8(data));
-            } else {
-                atomic_store_uint32_relax(&uart->ier, read_uint8(data));
-                ns16550a_update_irq(uart);
-            }
-            break;
-        case NS16550A_REG_LCR:
-            atomic_store_uint32_relax(&uart->lcr, read_uint8(data));
-            break;
-        case NS16550A_REG_MCR:
-            atomic_store_uint32_relax(&uart->mcr, read_uint8(data));
-            break;
-        case NS16550A_REG_SCR:
-            atomic_store_uint32_relax(&uart->scr, read_uint8(data));
-            break;
-    }
+    uart16550_core_write(&uart->core, offset, *(uint8_t*)data);
     return true;
 }
 
 static void ns16550a_update(rvvm_mmio_dev_t* dev)
 {
     ns16550a_dev_t* uart = dev->data;
-    chardev_update(uart->chardev);
+    uart16550_core_update(&uart->core);
 }
 
 static void ns16550a_remove(rvvm_mmio_dev_t* dev)
 {
     ns16550a_dev_t* uart = dev->data;
-    chardev_free(uart->chardev);
+    uart16550_core_cleanup(&uart->core);
     free(uart);
 }
 
@@ -206,14 +73,9 @@ PUBLIC rvvm_mmio_dev_t* ns16550a_init(rvvm_machine_t* machine, chardev_t* charde
                                       rvvm_irq_t irq)
 {
     ns16550a_dev_t* uart = safe_new_obj(ns16550a_dev_t);
-    uart->chardev        = chardev;
     uart->intc           = intc;
     uart->irq            = irq;
-
-    if (chardev) {
-        chardev->io_dev = uart;
-        chardev->notify = ns16550a_notify;
-    }
+    uart16550_core_init(&uart->core, chardev, ns16550a_irq, uart);
 
     rvvm_mmio_dev_t ns16550a = {
         .addr        = addr,
