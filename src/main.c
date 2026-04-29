@@ -32,6 +32,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #include "devices/ata.h"
 #include "devices/bochs-display.h"
+#include "devices/exar-pci.h"
 #include "devices/framebuffer.h"
 #include "devices/i2c-oc.h"
 #include "devices/ns16550a.h"
@@ -206,6 +207,10 @@ static void rvvm_print_help(void)
         "    -parport_in ...  File/fifo to source parport reverse-channel input from\n"
         "    -nonet           Disable networking\n"
         "    -serial     ...  Add more serial ports (Via pty/pipe path), or null\n"
+        "    -exar_pci   ...  Attach Exar XR17V35x PCIe combo serial card\n"
+        "                       Comma-list of pty/pipe paths or 'null'; count\n"
+        "                       picks model: 2=V352, 4=V354, 8=V358, 12=V4358,\n"
+        "                       16=V8358 (e.g. -exar_pci null,null,null,null)\n"
         "    -dtb        ...  Pass custom Device Tree Blob to the machine\n"
         "    -dumpdtb    ...  Dump auto-generated DTB to file\n"
         "    -v, -verbose     Enable verbose logging\n"
@@ -253,6 +258,62 @@ static void* parport_in_thread(void* arg)
     return NULL;
 }
 
+// Parse `-exar_pci` arg: comma-separated list of pty/pipe paths or "null".
+// Element count picks the chip variant (2/4/8/12/16 → V352/V354/V358/V4358/V8358).
+// On success attaches the card and returns true; on failure frees any chardevs
+// already created and returns false.
+static bool rvvm_cli_attach_exar_pci(rvvm_machine_t* machine, const char* spec)
+{
+    static const exar_model_t models[] = {
+        [2]  = EXAR_MODEL_XR17V352,
+        [4]  = EXAR_MODEL_XR17V354,
+        [8]  = EXAR_MODEL_XR17V358,
+        [12] = EXAR_MODEL_XR17V4358,
+        [16] = EXAR_MODEL_XR17V8358,
+    };
+
+    chardev_t* chardevs[16] = {0};
+    size_t     n            = 0;
+    const char* p           = spec;
+
+    while (*p && n < 16) {
+        const char* end = p;
+        while (*end && *end != ',') end++;
+        char path[256] = {0};
+        size_t len     = end - p;
+        if (len >= sizeof(path)) {
+            rvvm_error("Exar PCI: pty path too long");
+            goto fail;
+        }
+        rvvm_strlcpy(path, p, len + 1);
+        chardev_t* ch = chardev_pty_create(path);
+        if (ch == NULL && !rvvm_strcmp(path, "null")) {
+            rvvm_error("Exar PCI: failed to open \"%s\"", path);
+            goto fail;
+        }
+        chardevs[n++] = ch;
+        p             = end;
+        if (*p == ',') p++;
+    }
+
+    if (n != 2 && n != 4 && n != 8 && n != 12 && n != 16) {
+        rvvm_error("Exar PCI: port count %zu not supported (need 2/4/8/12/16)", n);
+        goto fail;
+    }
+
+    if (!exar_pci_init_auto(machine, models[n], chardevs)) {
+        rvvm_error("Exar PCI: attach failed");
+        goto fail;
+    }
+    return true;
+
+fail:
+    for (size_t i = 0; i < n; ++i) {
+        chardev_free(chardevs[i]);
+    }
+    return false;
+}
+
 static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_dev_t* tap)
 {
     UNUSED(tap);
@@ -295,6 +356,10 @@ static bool rvvm_cli_configure(rvvm_machine_t* machine, const char* bios, tap_de
                     return false;
                 }
                 ns16550a_init_auto(machine, chardev);
+            } else if (rvvm_strcmp(arg_name, "exar_pci")) {
+                if (!rvvm_cli_attach_exar_pci(machine, arg_val)) {
+                    return false;
+                }
             } else if (rvvm_strcmp(arg_name, "res")) {
                 size_t    len = 0;
                 rvvm_fb_t fb  = {
