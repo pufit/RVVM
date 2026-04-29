@@ -45,6 +45,19 @@ static void uart16550_set_irq(uart16550_core_t* core, bool level)
     }
 }
 
+// Mask of chardev flags the guest is currently allowed to observe.
+// RX is gated on `rx_armed` (kernel has enabled IER.RECV at least once);
+// TX always passes through — the guest can transmit before it's ready
+// to receive, and our backend never back-pressures so there's no risk.
+static uint32_t uart16550_visible_flags(uart16550_core_t* core)
+{
+    uint32_t flags = chardev_poll(core->chardev);
+    if (!atomic_load_uint32_relax(&core->rx_armed)) {
+        flags &= ~CHARDEV_RX;
+    }
+    return flags;
+}
+
 // Recompute IRQ assertion from current flags ∧ IER. Called whenever
 // either side changes: backend notify (flag delta) or guest IER write.
 static void uart16550_update_irq(uart16550_core_t* core)
@@ -57,10 +70,15 @@ static void uart16550_update_irq(uart16550_core_t* core)
 }
 
 // Chardev → core notify hook. Stored flags are updated atomically; if
-// they actually changed, re-evaluate the IRQ.
+// they actually changed, re-evaluate the IRQ. RX is masked off until
+// `rx_armed` flips so pre-init chardev traffic doesn't raise spurious
+// IRQs the kernel would then drain via junk-RBR-reads.
 static void uart16550_notify(void* io_dev, uint32_t flags)
 {
     uart16550_core_t* core = io_dev;
+    if (!atomic_load_uint32_relax(&core->rx_armed)) {
+        flags &= ~CHARDEV_RX;
+    }
     if (atomic_swap_uint32(&core->flags, flags) != flags) {
         uart16550_update_irq(core);
     }
@@ -71,7 +89,7 @@ static void uart16550_notify(void* io_dev, uint32_t flags)
 // the backend won't have raised an edge on its own.
 static void uart16550_poll_chardev(uart16550_core_t* core)
 {
-    uint32_t flags = chardev_poll(core->chardev);
+    uint32_t flags = uart16550_visible_flags(core);
     if (flags != atomic_load_uint32_relax(&core->flags)) {
         uart16550_notify(core, flags);
     }
@@ -108,7 +126,7 @@ uint8_t uart16550_core_read(uart16550_core_t* core, uint32_t reg)
         case UART16550_REG_RBR_DLL:
             if (atomic_load_uint32_relax(&core->lcr) & UART16550_LCR_DLAB) {
                 return atomic_load_uint32_relax(&core->dll);
-            } else if (chardev_poll(core->chardev) & CHARDEV_RX) {
+            } else if (uart16550_visible_flags(core) & CHARDEV_RX) {
                 uint8_t byte = 0;
                 chardev_read(core->chardev, &byte, 1);
                 uart16550_poll_chardev(core);
@@ -121,7 +139,7 @@ uint8_t uart16550_core_read(uart16550_core_t* core, uint32_t reg)
             }
             return atomic_load_uint32_relax(&core->ier);
         case UART16550_REG_IIR: {
-            uint32_t flags = chardev_poll(core->chardev);
+            uint32_t flags = uart16550_visible_flags(core);
             uint32_t ier   = atomic_load_uint32_relax(&core->ier);
             if ((flags & CHARDEV_RX) && (ier & UART16550_IER_RECV)) {
                 return UART16550_IIR_RECV | UART16550_IIR_FIFO;
@@ -135,7 +153,7 @@ uint8_t uart16550_core_read(uart16550_core_t* core, uint32_t reg)
         case UART16550_REG_MCR:
             return atomic_load_uint32_relax(&core->mcr);
         case UART16550_REG_LSR: {
-            uint32_t flags = chardev_poll(core->chardev);
+            uint32_t flags = uart16550_visible_flags(core);
             return ((flags & CHARDEV_RX) ? UART16550_LSR_RECV : 0)
                  | ((flags & CHARDEV_TX) ? UART16550_LSR_THR  : 0);
         }
@@ -167,6 +185,18 @@ void uart16550_core_write(uart16550_core_t* core, uint32_t reg, uint8_t val)
                 atomic_store_uint32_relax(&core->dlm, val);
             } else {
                 atomic_store_uint32_relax(&core->ier, val);
+                // Arm the RX gate the moment the kernel signals it
+                // wants to receive. Sticky — flow control later
+                // toggling RECV off doesn't silently re-enable junk
+                // draining at the next port reopen.
+                if (val & UART16550_IER_RECV) {
+                    atomic_store_uint32_relax(&core->rx_armed, 1);
+                    // Backfill flags from chardev. By now RX may have
+                    // been pending for a while with no IRQ raised; sync
+                    // through notify so the fresh-armed line raises if
+                    // data is already waiting.
+                    uart16550_poll_chardev(core);
+                }
                 uart16550_update_irq(core);
             }
             break;
