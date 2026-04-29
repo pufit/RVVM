@@ -201,4 +201,19 @@ public class RVVMNative {
 
     // Fills a long[5] with {pushed, popped, fed, accepted, tx_dropped}.
     public static native void parport_bridge_stats(long handle, long[] out);
+
+    //
+    // Exar XR17V35x PCIe combo serial JNI bridge
+    //
+    // Attaches an Exar PCIe combo serial card with 2/4/8/12/16 ports
+    // (XR17V352/V354/V358/V4358/V8358). Returns a long[] of per-port
+    // bridge handles, each compatible with ns16550a_bridge_poll/feed/stats.
+    //
+    // REQUIREMENT: the machine must have a PCI bus attached
+    // (RVVMNative.pci_bus_init_auto, or whatever sets one). Returns null
+    // if the machine has no PCI bus, the port count is invalid, or PCI
+    // device attach fails.
+    //
+
+    public static native long[] exar_pci_bridge_init(long machine, int n_ports);
 }

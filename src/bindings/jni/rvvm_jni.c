@@ -26,6 +26,7 @@
 #include "devices/rtc-goldfish.h"
 #include "devices/syscon.h"
 
+#include "devices/exar-pci.h"
 #include "devices/nvme.h"
 #include "devices/rtl8169.h"
 #include "devices/parport-pci.h"
@@ -1032,6 +1033,70 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_parport_1bridge_1stats(JNIEnv
         stats[4] = (jlong)b->tx_dropped;
     }
     (*env)->SetLongArrayRegion(env, out, 0, 5, stats);
+}
+
+/*
+ * Exar XR17V35x JNI bridge
+ *
+ * Multi-port wrapper around `jni_uart_bridge_create()`. Allocates `n_ports`
+ * bridges, hands their chardevs to `exar_pci_init_auto`, returns the bridge
+ * handles as a long[]. The caller is expected to use the returned handles
+ * with `ns16550a_bridge_poll/feed/stats` — those JNI methods take any
+ * bridge handle, the namespace prefix is historical.
+ *
+ * Requires the machine to have a PCI bus already attached
+ * (`pci_bus_init_auto`). We check upfront and log a useful error rather
+ * than fail silently inside `exar_pci_init_auto`'s NULL-bus path.
+ *
+ * Returns NULL (Java null) on:
+ *   - invalid n_ports (must be 2/4/8/12/16)
+ *   - missing PCI bus on the machine
+ *   - PCI device attach failure (slot exhaustion, etc.)
+ */
+JNIEXPORT jlongArray JNICALL Java_lekkit_rvvm_RVVMNative_exar_1pci_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                                  jlong machine, jint n_ports)
+{
+    UNUSED(cls);
+    if (n_ports != 2 && n_ports != 4 && n_ports != 8 && n_ports != 12 && n_ports != 16) {
+        rvvm_error("Exar PCI bridge: port count %d not supported (need 2/4/8/12/16)", (int)n_ports);
+        return NULL;
+    }
+    rvvm_machine_t* m = (rvvm_machine_t*)(size_t)machine;
+    if (!rvvm_get_pci_bus(m)) {
+        rvvm_error("Exar PCI bridge: machine has no PCI bus — call pci_bus_init_auto first");
+        return NULL;
+    }
+
+    jni_uart_bridge_t* bridges[16] = {0};
+    chardev_t*         chardevs[16] = {0};
+    for (int i = 0; i < n_ports; ++i) {
+        bridges[i]  = jni_uart_bridge_create();
+        chardevs[i] = &bridges[i]->chardev;
+    }
+
+    pci_dev_t* dev = exar_pci_init_auto(m, (exar_model_t)n_ports, chardevs);
+    if (dev == NULL) {
+        rvvm_error("Exar PCI bridge: device attach failed");
+        for (int i = 0; i < n_ports; ++i) {
+            chardev_free(&bridges[i]->chardev);
+        }
+        return NULL;
+    }
+
+    // Handles map 1:1 to ports (handle[i] drives port i). exar_pci_init
+    // already runs the bootstrap notify per port, so the bridges arrive
+    // with their flag cache in sync — no extra dance needed here.
+    jlongArray result = (*env)->NewLongArray(env, n_ports);
+    if (result == NULL) {
+        return NULL; // bridges leak alongside the now-attached PCI device,
+                     // freed when the machine is freed
+    }
+    jlong handles[16];
+    for (int i = 0; i < n_ports; ++i) {
+        handles[i] = (jlong)(size_t)bridges[i];
+    }
+    (*env)->SetLongArrayRegion(env, result, 0, n_ports, handles);
+    return result;
 }
 
 POP_OPTIMIZATION_SIZE
