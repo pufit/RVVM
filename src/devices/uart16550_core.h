@@ -54,6 +54,16 @@ typedef struct {
     uint32_t scr;
     uint32_t dll;
     uint32_t dlm;
+
+    // Sticky "kernel has enabled RX" gate. Real silicon's RBR is empty
+    // after reset; pre-init RBR reads return floating bus values which
+    // the kernel discards as junk. Our chardev backend never resets, so
+    // bytes that arrived before the guest finishes startup would get
+    // eaten by `serial8250_do_startup`'s two junk-drain RBR reads. We
+    // suppress chardev draining until the guest writes IER with the
+    // RECV bit (kernel signalling "I'm ready to receive"); flips true
+    // once and stays true until the core is destroyed.
+    uint32_t rx_armed;
 } uart16550_core_t;
 
 // Bind a chardev to a core in caller-owned storage. Hooks the chardev's
