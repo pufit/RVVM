@@ -62,6 +62,26 @@ PUBLIC uint16_t spi_attach_dev(spi_bus_t* bus, const spi_dev_t* dev_desc)
     return cs;
 }
 
+PUBLIC bool spi_detach_dev(spi_bus_t* bus, uint16_t cs_id)
+{
+    if (!bus || cs_id >= SPI_BUS_MAX_CS) return false;
+    spi_dev_t* slot = &bus->slaves[cs_id];
+    if (slot->transfer == NULL) return false;
+
+    spi_dev_t victim = *slot;
+    // Clear the slot first — `transfer == NULL` is the gate the dispatch
+    // path checks, so any racing transfer call from the controller
+    // thread that reaches the slot after this store sees an unpopulated
+    // line and returns 0xFF.
+    memset(slot, 0, sizeof(*slot));
+    bus->cs_present &= ~(1u << cs_id);
+
+    if (victim.remove) {
+        victim.remove(victim.data);
+    }
+    return true;
+}
+
 PUBLIC uint32_t spi_bus_cs_count(spi_bus_t* bus)
 {
     if (!bus || !bus->cs_present) return 0;

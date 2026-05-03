@@ -39,6 +39,17 @@ PUBLIC i2c_bus_t* i2c_oc_init_auto(rvvm_machine_t* machine);
 // Returns assigned device address or zero on error
 PUBLIC uint16_t   i2c_attach_dev(i2c_bus_t* bus, const i2c_dev_t* dev_desc);
 
+// Detach a slave by address. Calls the slave's remove hook and frees the
+// vector slot. Returns true if a slave was found and removed.
+//
+// Caller is responsible for ensuring no I2C transaction is in flight on
+// the target address. The MMIO dispatch path locks the bus while it
+// dereferences slave callbacks, so detach is safe against concurrent
+// guest accesses to *other* addresses, but a guest mid-transaction with
+// the detached slave will see the remove fire from under it. Soft-NACK
+// the slave first if that matters.
+PUBLIC bool       i2c_detach_dev(i2c_bus_t* bus, uint16_t addr);
+
 // Get I2C controller FDT node for nested device nodes
 PUBLIC struct fdt_node* i2c_bus_fdt_node(i2c_bus_t* bus);
 

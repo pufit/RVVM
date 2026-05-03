@@ -66,6 +66,20 @@ PUBLIC void       spi_bus_free(spi_bus_t* bus);
 // SPI_AUTO_CS on failure (slot occupied / out of range / out of slots).
 PUBLIC uint16_t   spi_attach_dev(spi_bus_t* bus, const spi_dev_t* dev_desc);
 
+// Detach a slave by chip-select line. Calls the slave's `remove` hook and
+// clears the slot, leaving the line in the same state as an unpopulated
+// CS (transfers return 0xFF, selects become no-ops). Returns true if a
+// slave was found and removed.
+//
+// The SPI dispatch path takes no bus-level lock — it assumes the
+// controller's MMIO write path serialises calls. Callers cycling slaves
+// from a non-controller thread must therefore drain any in-flight
+// transfer before calling (the JNI bridge pattern: set an `absent` flag,
+// wait one tick, then detach). The slot store itself is a single aligned
+// pointer write; a transfer racing with detach will see either the old
+// or new state, not a torn one.
+PUBLIC bool       spi_detach_dev(spi_bus_t* bus, uint16_t cs_id);
+
 // How many CS lines the bus is willing to reflect back to the host. The
 // SiFive controller probes its CS count by writing 0xFFFFFFFF to CSDEF
 // and reading back; we reflect (1 << count) - 1 worth of bits.

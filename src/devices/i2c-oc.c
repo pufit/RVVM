@@ -260,16 +260,51 @@ PUBLIC uint16_t i2c_attach_dev(i2c_bus_t* bus, const i2c_dev_t* dev_desc)
     if (dev_desc->addr == I2C_AUTO_ADDR) {
         tmp.addr = 0x8;
     }
+    spin_lock(&bus->lock);
     while (i2c_oc_get_dev(bus, tmp.addr)) {
         if (dev_desc->addr == I2C_AUTO_ADDR) {
             tmp.addr++;
         } else {
+            spin_unlock(&bus->lock);
             rvvm_warn("Duplicate I2C device address on a single bus");
             return 0;
         }
     }
     vector_push_back(bus->devices, tmp);
+    spin_unlock(&bus->lock);
     return tmp.addr;
+}
+
+PUBLIC bool i2c_detach_dev(i2c_bus_t* bus, uint16_t addr)
+{
+    if (bus == NULL) {
+        return false;
+    }
+    i2c_dev_t victim = {0};
+    bool      found  = false;
+    spin_lock(&bus->lock);
+    vector_foreach (bus->devices, i) {
+        if (vector_at(bus->devices, i).addr == addr) {
+            victim = vector_at(bus->devices, i);
+            vector_erase(bus->devices, i);
+            // If the in-progress transaction was talking to this address,
+            // forget the selection so the next CR_RD/WR doesn't index into
+            // a stale slot. Other addresses keep their selection.
+            if (bus->sel_addr == addr) {
+                bus->sel_addr = 0xFFFF;
+            }
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&bus->lock);
+    if (found && victim.remove) {
+        // Fire remove outside the bus lock — slave teardown may take its
+        // own locks (JNI bridges spinlock their ring buffers, etc.) and we
+        // don't want to invert ordering against MMIO dispatch.
+        victim.remove(victim.data);
+    }
+    return found;
 }
 
 PUBLIC struct fdt_node* i2c_bus_fdt_node(i2c_bus_t* bus)
