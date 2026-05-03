@@ -49,6 +49,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/rtc-goldfish.h"
 #include "devices/rtl8169.h"
 #include "devices/sound-hda.h"
+#include "devices/spi-sifive.h"
 #include "devices/syscon.h"
 #include "devices/usb-xhci.h"
 
@@ -202,6 +203,7 @@ static void rvvm_print_help(void)
         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
         "    -nogui           Disable display GUI\n"
         "    -nosound         Disable sound support\n"
+        "    -spi             Attach a SiFive (FU540) SPI controller (no slaves yet)\n"
         "    -parport_test    Attach an emulated NetMos 9900 PCI parallel port\n"
         "    -parport_out ... File to receive parport output (default: /tmp/rvvm-parport0.out)\n"
         "    -parport_in ...  File/fifo to source parport reverse-channel input from\n"
@@ -478,6 +480,13 @@ static int rvvm_cli_main(int argc, char** argv)
 
     if (rvvm_has_arg("hda_test")) {
         sound_hda_init_auto(machine);
+    }
+
+    if (rvvm_has_arg("spi")) {
+        // SiFive sifive,spi0 controller. No built-in slaves yet — Linux
+        // will probe and bind the master with zero children, leaving the
+        // bus available for future slave attachments.
+        spi_sifive_init_auto(machine);
     }
 
     if (rvvm_has_arg("parport_test")) {
