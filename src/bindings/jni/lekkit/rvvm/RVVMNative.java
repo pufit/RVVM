@@ -128,6 +128,29 @@ public class RVVMNative {
     public static native long rtl8169_init(long pci_bus, long tap);
     public static native long nvme_init(long pci_bus, String image_path, boolean rw);
 
+    //
+    // Intel HDA audio
+    //
+    // sound_hda_init_auto attaches an HDA device whose PCM is consumed by
+    // the compile-time backend (ALSA on Linux builds, silent otherwise).
+    // sound_hda_init_with_ring stages PCM into a 1 MiB native ring that
+    // the JVM drains via sound_hda_poll — works around the JDK 21/macOS
+    // arm64 AttachCurrentThread failure that hits when RVVM's stream
+    // worker pthread tries to call into Java directly.
+    //
+
+    public static native long sound_hda_init_auto(long machine);
+
+    // pciDevOut is a one-element long[] receiving the pci_dev_t* for
+    // PCIDevice.setPCIHandle. Returns ring handle, or 0 on failure.
+    public static native long sound_hda_init_with_ring(long machine, long[] pciDevOut);
+
+    // Drains up to out.length PCM bytes from the ring. Returns count read.
+    public static native int  sound_hda_poll(long sinkHandle, byte[] out);
+
+    // which: 0=total pushed, 1=total popped, 2=dropped, 3=current occupancy.
+    public static native long sound_hda_stats(long sinkHandle, int which);
+
     // Returns HID mouse handle
     public static native long hid_mouse_init_auto(long machine);
 
