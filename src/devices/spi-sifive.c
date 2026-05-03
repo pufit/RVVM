@@ -431,6 +431,7 @@ PUBLIC rvvm_mmio_dev_t* spi_sifive_init(rvvm_machine_t* machine, rvvm_addr_t add
     fdt_node_add_prop_u32(spi_fdt, "#size-cells", 0);
     fdt_node_add_prop_str(spi_fdt, "status", "okay");
     fdt_node_add_child(rvvm_get_fdt_soc(machine), spi_fdt);
+    spi_bus_set_fdt_node(spi->bus, spi_fdt);
 #endif
     return mmio;
 }

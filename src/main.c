@@ -49,6 +49,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/rtc-goldfish.h"
 #include "devices/rtl8169.h"
 #include "devices/sound-hda.h"
+#include "devices/spi-nor.h"
 #include "devices/spi-sifive.h"
 #include "devices/syscon.h"
 #include "devices/usb-xhci.h"
@@ -203,7 +204,10 @@ static void rvvm_print_help(void)
         "    -ata        ...  Explicitly attach storage image as ATA (IDE) device\n"
         "    -nogui           Disable display GUI\n"
         "    -nosound         Disable sound support\n"
-        "    -spi             Attach a SiFive (FU540) SPI controller (no slaves yet)\n"
+        "    -spi             Attach a SiFive (FU540) SPI controller\n"
+        "    -spi_flash  ...  Attach a Winbond W25Q SPI NOR flash backed by <path>\n"
+        "                       (implies -spi; image auto-created and 0xFF-filled)\n"
+        "    -spi_flash_size  Override flash capacity (e.g. 4M, 16M; default 8M)\n"
         "    -parport_test    Attach an emulated NetMos 9900 PCI parallel port\n"
         "    -parport_out ... File to receive parport output (default: /tmp/rvvm-parport0.out)\n"
         "    -parport_in ...  File/fifo to source parport reverse-channel input from\n"
@@ -482,11 +486,13 @@ static int rvvm_cli_main(int argc, char** argv)
         sound_hda_init_auto(machine);
     }
 
-    if (rvvm_has_arg("spi")) {
-        // SiFive sifive,spi0 controller. No built-in slaves yet — Linux
-        // will probe and bind the master with zero children, leaving the
-        // bus available for future slave attachments.
-        spi_sifive_init_auto(machine);
+    if (rvvm_has_arg("spi") || rvvm_has_arg("spi_flash")) {
+        rvvm_mmio_dev_t* spi_mmio = spi_sifive_init_auto(machine);
+        if (spi_mmio && rvvm_has_arg("spi_flash")) {
+            const char* path = rvvm_getarg("spi_flash");
+            uint64_t    sz   = rvvm_getarg_size("spi_flash_size");  // 0 → 8 MB default
+            spi_nor_attach(spi_sifive_get_bus(spi_mmio), SPI_AUTO_CS, path, sz);
+        }
     }
 
     if (rvvm_has_arg("parport_test")) {

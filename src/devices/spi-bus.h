@@ -12,6 +12,8 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "rvvmlib.h"
 
+struct fdt_node;
+
 /*
  * SPI master ↔ slave abstraction. The controller (e.g. spi-sifive) owns
  * the spi_bus_t and routes transfers to slaves indexed by chip-select
@@ -75,5 +77,11 @@ PUBLIC uint32_t   spi_bus_cs_count(spi_bus_t* bus);
 // matches an unconnected SPI line).
 PUBLIC void       spi_bus_select(spi_bus_t* bus, uint16_t cs_id, bool asserted);
 PUBLIC uint8_t    spi_bus_transfer(spi_bus_t* bus, uint16_t cs_id, uint8_t tx);
+
+// Controller's FDT node — slaves attach `flash@N`, `spidev@N`, etc. as
+// children of this node so the kernel walks them during SPI controller
+// probe. The controller sets this once at init time; slaves only read.
+PUBLIC void               spi_bus_set_fdt_node(spi_bus_t* bus, struct fdt_node* node);
+PUBLIC struct fdt_node*   spi_bus_fdt_node(spi_bus_t* bus);
 
 #endif

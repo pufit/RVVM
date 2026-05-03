@@ -17,8 +17,9 @@ PUSH_OPTIMIZATION_SIZE
 
 struct spi_bus_t {
     // Flat CS-indexed table. Slot empty when `transfer` is NULL.
-    spi_dev_t slaves[SPI_BUS_MAX_CS];
-    uint32_t  cs_present;  // bitmask of populated CS slots
+    spi_dev_t        slaves[SPI_BUS_MAX_CS];
+    uint32_t         cs_present;  // bitmask of populated CS slots
+    struct fdt_node* fdt_node;    // controller's FDT node (for child registration)
 };
 
 PUBLIC spi_bus_t* spi_bus_create(void)
@@ -93,6 +94,16 @@ PUBLIC uint8_t spi_bus_transfer(spi_bus_t* bus, uint16_t cs_id, uint8_t tx)
     spi_dev_t* dev = &bus->slaves[cs_id];
     if (!dev->transfer) return 0xFF;
     return dev->transfer(dev->data, tx);
+}
+
+PUBLIC void spi_bus_set_fdt_node(spi_bus_t* bus, struct fdt_node* node)
+{
+    if (bus) bus->fdt_node = node;
+}
+
+PUBLIC struct fdt_node* spi_bus_fdt_node(spi_bus_t* bus)
+{
+    return bus ? bus->fdt_node : NULL;
 }
 
 POP_OPTIMIZATION_SIZE
