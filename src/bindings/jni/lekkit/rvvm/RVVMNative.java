@@ -411,4 +411,51 @@ public class RVVMNative {
 
     // Fills long[4] with {total_transfers, writes_dropped, ring_occupancy, cursor}.
     public static native void spi_buffer_bridge_stats(long handle, long[] out);
+
+    //
+    // Generic shadow MMIO JNI bridge
+    //
+    // Attaches an MMIO region of caller-chosen size to the machine. The
+    // region is backed by a C-managed shadow buffer Java owns the contents
+    // of (peek/poke at any time via getByte/setByte/setBulk); guest reads
+    // see whatever the shadow holds at the moment of the read with no JNI
+    // upcall. Guest writes mutate the shadow AND emit a 16-byte event into
+    // a ring the JVM drains via pollWrites on tick.
+    //
+    // Write event wire format (16 bytes/event, fixed stride):
+    //   off 0..3    uint32 LE   region offset of the access
+    //   off 4..7    uint32 LE   access size in bytes (1, 2, 4, or 8)
+    //   off 8..15   uint8[8]    written value, LE-padded to 8 bytes
+    //
+    // No FDT node is generated — the guest must know the address to
+    // access it. The actual assigned base address is returned via
+    // addrOut[0] (since rvvm picks the address if `addr` is busy or 0).
+    //
+    // Use case: any in-game device shape that doesn't fit a standard bus
+    // — custom redstone-bus controller, instrumentation MMIO for in-world
+    // sensors, mailbox between mod-side block entities and guest userspace.
+    //
+
+    /** Fixed wire stride per event in pollWrites buffers. */
+    public static final int MMIO_EVENT_BYTES = 16;
+
+    // size: region size in bytes; addr: requested base address (0 picks one).
+    // Returns bridge handle, or 0 on failure. addrOut[0] receives the
+    // assigned address (single-element long[]).
+    public static native long mmio_shadow_bridge_init(long machine, long addr, long size, long[] addrOut);
+
+    public static native int  mmio_shadow_bridge_get_byte(long handle, long off);
+    public static native void mmio_shadow_bridge_set_byte(long handle, long off, int value);
+
+    // Bulk shadow update: copy data into shadow[off..off+data.length).
+    // Truncated at shadow boundary; returns bytes actually written.
+    public static native int  mmio_shadow_bridge_set_bulk(long handle, long off, byte[] data);
+
+    // Drain queued write events; out length must be a multiple of 16.
+    // Returns number of events drained.
+    public static native int  mmio_shadow_bridge_poll_writes(long handle, byte[] out);
+
+    // Fills long[5] with {total_reads, total_writes, events_dropped,
+    // ring_occupancy_bytes, shadow_size}.
+    public static native void mmio_shadow_bridge_stats(long handle, long[] out);
 }

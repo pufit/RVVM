@@ -42,6 +42,8 @@
 #include "devices/mcp251x.h"
 #include "devices/spi-sifive.h"
 
+#include <rvvm/rvvm_region.h>
+
 PUSH_OPTIMIZATION_SIZE
 
 JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_check_1abi(JNIEnv* env, jclass cls, //
@@ -1980,6 +1982,279 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1stats(JN
         stats[3] = (jlong)b->cursor;
     }
     (*env)->SetLongArrayRegion(env, out, 0, 4, stats);
+}
+
+/*
+ * Generic shadow MMIO JNI bridge
+ *
+ * Attaches an MMIO region of caller-chosen size to the machine. The
+ * region is backed by a C-managed shadow buffer Java owns the contents
+ * of: peek/poke at any time via getByte/setByte/setBulk, guest reads
+ * see whatever the shadow holds at the moment of the read with zero
+ * JNI upcalls (one memcpy from C-side state). Guest writes mutate the
+ * shadow AND emit an event into a 16-byte-stride ring the JVM drains
+ * via pollWrites on tick.
+ *
+ * Wire shape of write events (16 bytes per event, fixed stride for
+ * batched poll):
+ *
+ *   off 0..3    uint32 LE   region offset of the access
+ *   off 4..7    uint32 LE   access size in bytes (1, 2, 4, or 8)
+ *   off 8..15   uint8[8]    written value, LE-padded to 8 bytes
+ *
+ * The 8-byte value field covers all natural guest write sizes (rv64
+ * STD = 8 bytes). For smaller writes, the upper bytes are zero.
+ *
+ * Threading: read/write callbacks fire on whatever CPU thread is
+ * doing the access (region API allows concurrent calls per its
+ * docstring). Shadow + event ring access is spinlock-guarded; Java
+ * peek/poke/poll lock the same spinlock.
+ *
+ * No FDT node is generated — the guest must know the address to access
+ * it. The assigned base address is returned via the addrOut[0]
+ * out-parameter so Java can inject it into a kernel cmdline /
+ * userspace mmap call site as needed.
+ *
+ * Use case: any in-game device shape that doesn't fit a standard bus
+ * (custom redstone-bus controller, instrumentation MMIO for in-world
+ * sensors, mailbox between mod-side block entities and guest userspace).
+ */
+
+#define JNI_MMIO_EVENT_BYTES 16
+#define JNI_MMIO_EVENT_STRIDE_LOG2 4 // log2(16)
+#define JNI_MMIO_RING_BYTES (JNI_MMIO_EVENT_BYTES * 256) // 256 events buffered
+
+typedef struct {
+    spinlock_t lock;
+    uint8_t*   shadow;
+    size_t     shadow_size;
+    ringbuf_t  events;
+
+    uint64_t   total_reads;
+    uint64_t   total_writes;
+    uint64_t   events_dropped;
+} jni_mmio_bridge_t;
+
+static void jni_mmio_read(rvvm_reg_dev_t* dev, void* data, size_t size, size_t off)
+{
+    jni_mmio_bridge_t* b = rvvm_region_data(dev);
+    scoped_spin_lock (&b->lock) {
+        if (off + size <= b->shadow_size) {
+            memcpy(data, b->shadow + off, size);
+        } else {
+            memset(data, 0, size); // out-of-range: read 0
+        }
+        b->total_reads += 1;
+    }
+}
+
+static void jni_mmio_write(rvvm_reg_dev_t* dev, const void* data, size_t size, size_t off)
+{
+    jni_mmio_bridge_t* b = rvvm_region_data(dev);
+    scoped_spin_lock (&b->lock) {
+        if (off + size <= b->shadow_size) {
+            memcpy(b->shadow + off, data, size);
+        }
+        // Emit event regardless of in-range — the access happened.
+        uint8_t evt[JNI_MMIO_EVENT_BYTES] = {0};
+        evt[0] = (uint8_t)(off);
+        evt[1] = (uint8_t)(off >> 8);
+        evt[2] = (uint8_t)(off >> 16);
+        evt[3] = (uint8_t)(off >> 24);
+        evt[4] = (uint8_t)size;
+        // sizeof(size) > 1 byte but writes are always 1/2/4/8, so high bytes stay 0
+        size_t copy = size > 8 ? 8 : size;
+        memcpy(evt + 8, data, copy);
+
+        if (ringbuf_space(&b->events) < JNI_MMIO_EVENT_BYTES) {
+            uint8_t junk[JNI_MMIO_EVENT_BYTES];
+            ringbuf_read(&b->events, junk, JNI_MMIO_EVENT_BYTES);
+            b->events_dropped += JNI_MMIO_EVENT_BYTES;
+        }
+        ringbuf_write(&b->events, evt, JNI_MMIO_EVENT_BYTES);
+        b->total_writes += 1;
+    }
+}
+
+static void jni_mmio_cleanup(rvvm_reg_dev_t* dev)
+{
+    jni_mmio_bridge_t* b = rvvm_region_data(dev);
+    if (b == NULL) return;
+    free(b->shadow);
+    ringbuf_destroy(&b->events);
+    free(b);
+}
+
+static const rvvm_reg_type_t jni_mmio_reg_type = {
+    .name     = "jni-mmio-shadow",
+    .read     = jni_mmio_read,
+    .write    = jni_mmio_write,
+    .cleanup  = jni_mmio_cleanup,
+    .min_size = 1,
+    .max_size = 8,
+};
+
+/*
+ * Attach a shadow MMIO region of `size` bytes to `machine`. `addr` is
+ * a *requested* base address; if 0 or busy, the region API picks a
+ * free address. The actual assigned address is written to addrOut[0]
+ * (single-element long[]).
+ *
+ * Returns the bridge handle, or 0 on failure (in which case addrOut[0]
+ * is also 0).
+ */
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                                jlong machine, jlong addr,
+                                                                                jlong size, jlongArray addrOut)
+{
+    UNUSED(cls);
+    if (size <= 0 || size > (jlong)0x40000000) {
+        rvvm_error("MMIO shadow bridge: invalid size %lld", (long long)size);
+        return 0;
+    }
+
+    jni_mmio_bridge_t* b = safe_new_obj(jni_mmio_bridge_t);
+    b->shadow      = safe_new_arr(uint8_t, (size_t)size);
+    b->shadow_size = (size_t)size;
+    ringbuf_create(&b->events, JNI_MMIO_RING_BYTES);
+
+    rvvm_reg_desc_t desc = {
+        .addr = (rvvm_addr_t)addr,
+        .size = (size_t)size,
+        .data = b,
+        .type = &jni_mmio_reg_type,
+    };
+    rvvm_reg_dev_t* dev = rvvm_region_init_auto((rvvm_machine_t*)(size_t)machine, &desc);
+    if (dev == NULL) {
+        // cleanup callback will fire on attach failure per region API
+        // contract; b is freed there. Don't double-free here.
+        rvvm_error("MMIO shadow bridge: rvvm_region_init failed");
+        return 0;
+    }
+
+    if (addrOut != NULL && (*env)->GetArrayLength(env, addrOut) >= 1) {
+        jlong out[1] = { (jlong)desc.addr };
+        (*env)->SetLongArrayRegion(env, addrOut, 0, 1, out);
+    }
+    return (jlong)(size_t)b;
+}
+
+/*
+ * Read one byte of the shadow. Out-of-range offsets return 0.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1get_1byte(JNIEnv* env, jclass cls, //
+                                                                                    jlong handle, jlong off)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return 0;
+    jni_mmio_bridge_t* b = (jni_mmio_bridge_t*)(size_t)handle;
+    jint v = 0;
+    scoped_spin_lock (&b->lock) {
+        if (off >= 0 && (size_t)off < b->shadow_size) {
+            v = b->shadow[off];
+        }
+    }
+    return v;
+}
+
+/*
+ * Set one byte of the shadow. Out-of-range offsets are silent no-ops.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1set_1byte(JNIEnv* env, jclass cls, //
+                                                                                    jlong handle, jlong off, jint value)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return;
+    jni_mmio_bridge_t* b = (jni_mmio_bridge_t*)(size_t)handle;
+    scoped_spin_lock (&b->lock) {
+        if (off >= 0 && (size_t)off < b->shadow_size) {
+            b->shadow[off] = (uint8_t)(value & 0xFF);
+        }
+    }
+}
+
+/*
+ * Bulk shadow update. Copies `data[0..len)` into shadow[off..off+len).
+ * Writes outside the shadow are silently truncated (so a Java caller
+ * with an off-by-one doesn't trash adjacent memory). Returns the
+ * number of bytes actually written.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1set_1bulk(JNIEnv* env, jclass cls, //
+                                                                                    jlong handle, jlong off,
+                                                                                    jbyteArray data)
+{
+    UNUSED(cls);
+    if (handle == 0 || data == NULL) return 0;
+    jni_mmio_bridge_t* b   = (jni_mmio_bridge_t*)(size_t)handle;
+    jsize              len = (*env)->GetArrayLength(env, data);
+    if (len <= 0 || off < 0) return 0;
+
+    jbyte* src = (*env)->GetByteArrayElements(env, data, NULL);
+    if (src == NULL) return 0;
+
+    jsize written = 0;
+    scoped_spin_lock (&b->lock) {
+        size_t start = (size_t)off;
+        if (start < b->shadow_size) {
+            size_t avail = b->shadow_size - start;
+            size_t copy  = (size_t)len > avail ? avail : (size_t)len;
+            memcpy(b->shadow + start, src, copy);
+            written = (jsize)copy;
+        }
+    }
+    (*env)->ReleaseByteArrayElements(env, data, src, JNI_ABORT);
+    return (jint)written;
+}
+
+/*
+ * Drain queued write events into `out`. Buffer length must be a
+ * multiple of 16 (JNI_MMIO_EVENT_BYTES). Returns the number of events
+ * actually drained.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1poll_1writes(JNIEnv* env, jclass cls, //
+                                                                                       jlong handle, jbyteArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return 0;
+    jni_mmio_bridge_t* b   = (jni_mmio_bridge_t*)(size_t)handle;
+    jsize              cap = (*env)->GetArrayLength(env, out);
+    jsize              max_evts = cap >> JNI_MMIO_EVENT_STRIDE_LOG2;
+    if (max_evts <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, out, NULL);
+    if (buf == NULL) return 0;
+
+    size_t got = 0;
+    scoped_spin_lock (&b->lock) {
+        got = ringbuf_read(&b->events, buf, (size_t)max_evts * JNI_MMIO_EVENT_BYTES);
+    }
+    (*env)->ReleaseByteArrayElements(env, out, buf, 0);
+    return (jint)(got >> JNI_MMIO_EVENT_STRIDE_LOG2);
+}
+
+/*
+ * Fill a long[5] with {total_reads, total_writes, events_dropped,
+ * ring_occupancy_bytes, shadow_size}.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_mmio_1shadow_1bridge_1stats(JNIEnv* env, jclass cls, //
+                                                                                jlong handle, jlongArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return;
+    jni_mmio_bridge_t* b = (jni_mmio_bridge_t*)(size_t)handle;
+    if ((*env)->GetArrayLength(env, out) < 5) return;
+
+    jlong stats[5];
+    scoped_spin_lock (&b->lock) {
+        stats[0] = (jlong)b->total_reads;
+        stats[1] = (jlong)b->total_writes;
+        stats[2] = (jlong)b->events_dropped;
+        stats[3] = (jlong)ringbuf_avail(&b->events);
+        stats[4] = (jlong)b->shadow_size;
+    }
+    (*env)->SetLongArrayRegion(env, out, 0, 5, stats);
 }
 
 POP_OPTIMIZATION_SIZE
