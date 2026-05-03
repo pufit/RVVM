@@ -34,7 +34,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "devices/bochs-display.h"
 #include "devices/exar-pci.h"
 #include "devices/framebuffer.h"
+#include "devices/can-bus.h"
+#include "devices/can-echo.h"
 #include "devices/i2c-oc.h"
+#include "devices/mcp251x.h"
 #include "devices/ns16550a.h"
 #include "devices/nvme.h"
 #include "devices/parport-pci.h"
@@ -208,6 +211,10 @@ static void rvvm_print_help(void)
         "    -spi_flash  ...  Attach a Winbond W25Q SPI NOR flash backed by <path>\n"
         "                       (implies -spi; image auto-created and 0xFF-filled)\n"
         "    -spi_flash_size  Override flash capacity (e.g. 4M, 16M; default 8M)\n"
+        "    -mcp2515         Attach a Microchip MCP2515 CAN controller via SPI\n"
+        "                       (implies -spi; loopback-mode self-test ready)\n"
+        "    -can_test        Attach -mcp2515 plus an in-emulator echo responder\n"
+        "                       (frames with SFF id < 0x100 come back +0x100)\n"
         "    -parport_test    Attach an emulated NetMos 9900 PCI parallel port\n"
         "    -parport_out ... File to receive parport output (default: /tmp/rvvm-parport0.out)\n"
         "    -parport_in ...  File/fifo to source parport reverse-channel input from\n"
@@ -486,12 +493,23 @@ static int rvvm_cli_main(int argc, char** argv)
         sound_hda_init_auto(machine);
     }
 
-    if (rvvm_has_arg("spi") || rvvm_has_arg("spi_flash")) {
+    if (rvvm_has_arg("spi") || rvvm_has_arg("spi_flash")
+        || rvvm_has_arg("mcp2515") || rvvm_has_arg("can_test")) {
         rvvm_mmio_dev_t* spi_mmio = spi_sifive_init_auto(machine);
         if (spi_mmio && rvvm_has_arg("spi_flash")) {
             const char* path = rvvm_getarg("spi_flash");
             uint64_t    sz   = rvvm_getarg_size("spi_flash_size");  // 0 → 8 MB default
             spi_nor_attach(spi_sifive_get_bus(spi_mmio), SPI_AUTO_CS, path, sz);
+        }
+        if (spi_mmio && (rvvm_has_arg("mcp2515") || rvvm_has_arg("can_test"))) {
+            rvvm_intc_t* intc    = rvvm_get_intc(machine);
+            can_bus_t*   can_bus = NULL;
+            if (rvvm_has_arg("can_test")) {
+                can_bus = can_bus_create();
+                can_echo_attach(can_bus, 0x100);
+            }
+            mcp251x_attach(spi_sifive_get_bus(spi_mmio), SPI_AUTO_CS,
+                           intc, rvvm_alloc_irq(intc), can_bus);
         }
     }
 
