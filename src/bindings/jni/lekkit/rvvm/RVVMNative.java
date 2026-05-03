@@ -293,4 +293,34 @@ public class RVVMNative {
     // Fills a long[5] with {pushed, popped, fed, rx_dropped, ring_occupancy}
     // (all in bytes; divide by 16 for frame counts).
     public static native void can_node_bridge_stats(long handle, long[] out);
+
+    //
+    // I2C sensor JNI bridge — read-shadow register file
+    //
+    // Attaches a 256-byte shadow-register I2C slave the guest can read like
+    // any sensor / EEPROM / IO expander. Java updates the shadow at any time
+    // via set/setBulk; the next guest read at that register address sees
+    // the new value. Guest writes are captured into a (register, value)
+    // event ring the JVM drains via pollWrites on tick.
+    //
+    // No C→Java upcalls — read latency is one memcpy from the shadow.
+    // Requires the machine to have an I2C bus already attached
+    // (i2c_bus_init_auto).
+    //
+
+    // addr=0 picks an automatic address. Returns bridge handle, or 0 on failure.
+    public static native long i2c_sensor_bridge_init(long machine, int addr);
+
+    // Update one shadow register; reg masked to 0..255.
+    public static native void i2c_sensor_bridge_set(long handle, int reg, int value);
+
+    // Bulk shadow update: copy data into shadow[off..off+data.length), wrapping at 256.
+    public static native int  i2c_sensor_bridge_set_bulk(long handle, int off, byte[] data);
+
+    // Drain queued (addr, value) write events; out length must be even.
+    // Returns number of (addr, value) PAIRS drained (not bytes).
+    public static native int  i2c_sensor_bridge_poll_writes(long handle, byte[] out);
+
+    // Fills long[4] with {total_reads, total_writes, writes_dropped, ring_occupancy}.
+    public static native void i2c_sensor_bridge_stats(long handle, long[] out);
 }
