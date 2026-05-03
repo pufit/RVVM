@@ -259,4 +259,38 @@ public class RVVMNative {
     //
 
     public static native long[] exar_pci_bridge_init(long machine, int n_ports);
+
+    //
+    // CAN node JNI bridge
+    //
+    // Attaches a virtual CAN node that the guest sees through an MCP2515
+    // SPI controller (Linux's mcp251x driver binds; can0 appears). Frames
+    // the guest broadcasts on can0 land in a 256-frame ring the JVM drains
+    // via poll(); frames the JVM pushes via feed() are broadcast on the
+    // bus and surface to the guest via the MCP2515's RX path.
+    //
+    // Frame wire format on disk (16 bytes, fixed stride):
+    //   off 0..3   uint32 LE   can_id (with CAN_EFF/RTR/ERR flag bits)
+    //   off 4      uint8       dlc (0..8)
+    //   off 5..7   reserved (zero)
+    //   off 8..15  data[0..7]
+    //
+    // The bridge handle is freed automatically when its owning machine is
+    // freed.
+    //
+
+    // Returns a bridge handle (opaque), or 0 on failure.
+    public static native long can_node_bridge_init(long machine);
+
+    // Drains queued guest frames into out (length must be multiple of 16).
+    // Returns the number of frames actually drained.
+    public static native int  can_node_bridge_poll(long handle, byte[] out);
+
+    // Broadcasts n_frames packed in `in` onto the bus. Returns the count
+    // actually broadcast (== n_frames unless `in` is too short).
+    public static native int  can_node_bridge_feed(long handle, byte[] in, int n_frames);
+
+    // Fills a long[5] with {pushed, popped, fed, rx_dropped, ring_occupancy}
+    // (all in bytes; divide by 16 for frame counts).
+    public static native void can_node_bridge_stats(long handle, long[] out);
 }

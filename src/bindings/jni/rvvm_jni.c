@@ -38,6 +38,10 @@
 #include "devices/gpio-sifive.h"
 #include "devices/hid_api.h"
 
+#include "devices/can-bus.h"
+#include "devices/mcp251x.h"
+#include "devices/spi-sifive.h"
+
 PUSH_OPTIMIZATION_SIZE
 
 JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_check_1abi(JNIEnv* env, jclass cls, //
@@ -1273,6 +1277,250 @@ JNIEXPORT jlongArray JNICALL Java_lekkit_rvvm_RVVMNative_exar_1pci_1bridge_1init
     }
     (*env)->SetLongArrayRegion(env, result, 0, n_ports, handles);
     return result;
+}
+
+/*
+ * CAN node JNI bridge
+ *
+ * Attaches a virtual CAN node to a software can_bus_t the guest sees
+ * through an MCP2515 controller (over SPI). Frames the guest broadcasts
+ * on its can0 land in a ring the JVM drains via poll(); frames the JVM
+ * pushes via feed() are broadcast on the bus and surface to the guest
+ * through the MCP2515's RX path.
+ *
+ * Wire shape on disk (12 bytes per frame, fixed stride for batched
+ * poll/feed):
+ *
+ *   off 0..3   uint32 LE   can_id (with CAN_EFF/RTR/ERR flag bits)
+ *   off 4      uint8       dlc (0..8)
+ *   off 5..11  uint8[7]    data[0..6]
+ *   off 11..18 wait — reread: 8 bytes data starts at 4
+ *
+ * Actually we want 16-byte stride for natural alignment and easy
+ * batching. Layout:
+ *
+ *   off 0..3   can_id LE
+ *   off 4      dlc
+ *   off 5..7   reserved (zero on poll, ignored on feed)
+ *   off 8..15  data[0..7]
+ *
+ * Threading: rx callback fires from whatever thread broadcasts on the
+ * bus (CPU thread for guest TX, the eventloop tick where MCP2515 frames
+ * land). Java poll/feed run on JVM threads. Ring access is spinlock-
+ * guarded; we never call into Java from rx (no upcall, just memcpy into
+ * the ring). Feed → can_bus_broadcast may re-enter rx on other slaves;
+ * we don't hold our lock across it.
+ *
+ * Topology: each call to can_node_bridge_init wires a fresh SPI
+ * controller + MCP2515 + can_bus_t. Two bridges on the same machine
+ * therefore appear to the guest as two independent SPI controllers
+ * (each with its own can0 / can1 / ...). Multi-node-on-one-bus is a
+ * future extension via a separate "attach to existing can_bus" entry
+ * point — not in this commit.
+ */
+
+#define JNI_CAN_FRAME_BYTES 16
+#define JNI_CAN_RING_BYTES  (JNI_CAN_FRAME_BYTES * 256) // 256 frames buffered
+
+typedef struct {
+    can_bus_t*  bus;
+    spinlock_t  lock;
+    ringbuf_t   rx;                 // guest TX → Java drain
+    uint64_t    total_pushed;       // bytes guest broadcast (× JNI_CAN_FRAME_BYTES per frame)
+    uint64_t    total_popped;       // bytes Java drained
+    uint64_t    total_fed;          // bytes Java has injected
+    uint64_t    rx_dropped;         // bytes dropped on ring overflow
+} jni_can_bridge_t;
+
+static void jni_can_pack(uint8_t out[JNI_CAN_FRAME_BYTES], const can_frame_t* f)
+{
+    out[0] = (uint8_t)(f->can_id);
+    out[1] = (uint8_t)(f->can_id >> 8);
+    out[2] = (uint8_t)(f->can_id >> 16);
+    out[3] = (uint8_t)(f->can_id >> 24);
+    out[4] = f->dlc;
+    out[5] = 0;
+    out[6] = 0;
+    out[7] = 0;
+    memcpy(out + 8, f->data, CAN_FRAME_MAX_DATA);
+}
+
+static void jni_can_unpack(can_frame_t* f, const uint8_t in[JNI_CAN_FRAME_BYTES])
+{
+    f->can_id = ((uint32_t)in[0])       | ((uint32_t)in[1] << 8)
+              | ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+    f->dlc    = in[4] > CAN_FRAME_MAX_DATA ? CAN_FRAME_MAX_DATA : in[4];
+    memcpy(f->data, in + 8, CAN_FRAME_MAX_DATA);
+}
+
+static void jni_can_rx(void* dev, const can_frame_t* frame)
+{
+    jni_can_bridge_t* b = dev;
+    uint8_t           packed[JNI_CAN_FRAME_BYTES];
+    jni_can_pack(packed, frame);
+    scoped_spin_lock (&b->lock) {
+        if (ringbuf_space(&b->rx) < JNI_CAN_FRAME_BYTES) {
+            // Ring full: drop the oldest whole frame.
+            uint8_t junk[JNI_CAN_FRAME_BYTES];
+            ringbuf_read(&b->rx, junk, JNI_CAN_FRAME_BYTES);
+            b->rx_dropped += JNI_CAN_FRAME_BYTES;
+        }
+        ringbuf_write(&b->rx, packed, JNI_CAN_FRAME_BYTES);
+        b->total_pushed += JNI_CAN_FRAME_BYTES;
+    }
+}
+
+static void jni_can_remove(void* dev)
+{
+    jni_can_bridge_t* b = dev;
+    ringbuf_destroy(&b->rx);
+    free(b);
+}
+
+/*
+ * Wire a fresh CAN node on `machine`. Internally creates a SiFive SPI
+ * controller, attaches an MCP2515 to it, allocates a can_bus_t, and
+ * registers a JNI slave that captures broadcasts. Returns the bridge
+ * handle (jlong), or 0 on failure.
+ *
+ * The SPI controller and MCP2515 are owned by the machine and freed on
+ * machine destruction. The bridge struct itself is freed when the
+ * can_bus_t is freed (which happens during MCP2515 cleanup, since
+ * mcp251x_attach takes ownership of the bus).
+ */
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                            jlong machine)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    rvvm_machine_t* m = (rvvm_machine_t*)(size_t)machine;
+
+    rvvm_mmio_dev_t* spi_mmio = spi_sifive_init_auto(m);
+    if (spi_mmio == NULL) {
+        rvvm_error("CAN bridge: spi_sifive_init_auto failed");
+        return 0;
+    }
+
+    can_bus_t* bus = can_bus_create();
+    if (bus == NULL) {
+        rvvm_error("CAN bridge: can_bus_create failed");
+        return 0;
+    }
+
+    jni_can_bridge_t* b = safe_new_obj(jni_can_bridge_t);
+    b->bus = bus;
+    ringbuf_create(&b->rx, JNI_CAN_RING_BYTES);
+
+    can_dev_t desc = {
+        .data   = b,
+        .rx     = jni_can_rx,
+        .remove = jni_can_remove,
+    };
+    can_bus_attach(bus, &desc);
+
+    rvvm_intc_t* intc = rvvm_get_intc(m);
+    if (mcp251x_attach(spi_sifive_get_bus(spi_mmio), SPI_AUTO_CS,
+                       intc, rvvm_alloc_irq(intc), bus) == SPI_AUTO_CS) {
+        // Attach failed — bus and bridge leak alongside the SPI
+        // controller still attached to the machine. No clean unwind
+        // path because rvvm doesn't expose mmio-detach for the SiFive
+        // controller; matches existing parport bridge behaviour on
+        // attach failure.
+        rvvm_error("CAN bridge: mcp251x_attach failed");
+        return 0;
+    }
+
+    return (jlong)(size_t)b;
+}
+
+/*
+ * Drain queued guest CAN frames into `out`. `out` length must be a
+ * multiple of 16 (JNI_CAN_FRAME_BYTES) — extra trailing bytes are
+ * ignored. Returns the number of frames actually drained.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1poll(JNIEnv* env, jclass cls, //
+                                                                           jlong handle, jbyteArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return 0;
+    jni_can_bridge_t* b   = (jni_can_bridge_t*)(size_t)handle;
+    jsize             cap = (*env)->GetArrayLength(env, out);
+    jsize             max_frames = cap / JNI_CAN_FRAME_BYTES;
+    if (max_frames <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, out, NULL);
+    if (buf == NULL) return 0;
+
+    size_t got = 0;
+    scoped_spin_lock (&b->lock) {
+        got = ringbuf_read(&b->rx, buf, (size_t)max_frames * JNI_CAN_FRAME_BYTES);
+        b->total_popped += got;
+    }
+    (*env)->ReleaseByteArrayElements(env, out, buf, 0);
+    return (jint)(got / JNI_CAN_FRAME_BYTES);
+}
+
+/*
+ * Broadcast `n_frames` packed in `in` (each 16 bytes) onto the bus.
+ * Returns the count actually broadcast (== n_frames unless `in` is too
+ * short to hold them, in which case we cap to what fits).
+ *
+ * `from` for the broadcast is the bridge itself, so the JVM-injected
+ * frames are NOT redelivered into our own rx ring — only the guest's
+ * MCP2515 sees them.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1feed(JNIEnv* env, jclass cls, //
+                                                                           jlong handle, jbyteArray in,
+                                                                           jint n_frames)
+{
+    UNUSED(cls);
+    if (handle == 0 || in == NULL || n_frames <= 0) return 0;
+    jni_can_bridge_t* b   = (jni_can_bridge_t*)(size_t)handle;
+    jsize             len = (*env)->GetArrayLength(env, in);
+    jint              cap = len / JNI_CAN_FRAME_BYTES;
+    if (n_frames > cap) n_frames = cap;
+    if (n_frames <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, in, NULL);
+    if (buf == NULL) return 0;
+
+    for (jint i = 0; i < n_frames; ++i) {
+        can_frame_t f;
+        jni_can_unpack(&f, (const uint8_t*)(buf + i * JNI_CAN_FRAME_BYTES));
+        // Broadcast outside our spinlock — slaves' rx callbacks may
+        // chain back through can_bus_broadcast (e.g. echo responder),
+        // and our own rx is a no-op for `from == b`.
+        can_bus_broadcast(b->bus, b, &f);
+    }
+
+    (*env)->ReleaseByteArrayElements(env, in, buf, JNI_ABORT);
+    scoped_spin_lock (&b->lock) {
+        b->total_fed += (uint64_t)n_frames * JNI_CAN_FRAME_BYTES;
+    }
+    return n_frames;
+}
+
+/*
+ * Fill a long[5] with {pushed, popped, fed, rx_dropped, ring_occupancy}
+ * (all in bytes; divide by 16 for frame counts).
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1stats(JNIEnv* env, jclass cls, //
+                                                                            jlong handle, jlongArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return;
+    jni_can_bridge_t* b = (jni_can_bridge_t*)(size_t)handle;
+    if ((*env)->GetArrayLength(env, out) < 5) return;
+
+    jlong stats[5];
+    scoped_spin_lock (&b->lock) {
+        stats[0] = (jlong)b->total_pushed;
+        stats[1] = (jlong)b->total_popped;
+        stats[2] = (jlong)b->total_fed;
+        stats[3] = (jlong)b->rx_dropped;
+        stats[4] = (jlong)ringbuf_avail(&b->rx);
+    }
+    (*env)->SetLongArrayRegion(env, out, 0, 5, stats);
 }
 
 POP_OPTIMIZATION_SIZE
