@@ -323,4 +323,60 @@ public class RVVMNative {
 
     // Fills long[4] with {total_reads, total_writes, writes_dropped, ring_occupancy}.
     public static native void i2c_sensor_bridge_stats(long handle, long[] out);
+
+    //
+    // USB device bridge
+    //
+    // Attach a USB 2.0 High-Speed device whose control/xfer callbacks
+    // are serviced by C (descriptor synthesis + per-endpoint packet
+    // queues). Java code drives endpoints with the same polled-mailbox
+    // pattern as the NS16550A and HDA bridges: feed() pushes packets
+    // toward the guest on IN endpoints; poll() drains packets the
+    // guest wrote on OUT endpoints.
+    //
+    // Endpoint address encoding follows USB convention:
+    //   bit 7   = direction (1 = IN / device-to-host)
+    //   bits 3..0 = endpoint number (1..15; 0 is control EP0, handled
+    //               internally and not exposed via feed/poll).
+    //
+    // For HID devices, pass class_desc_type=0x21 (USB HID descriptor
+    // type), class_desc = 9-byte HID class descriptor to embed in the
+    // configuration descriptor, and report_desc = the raw HID report
+    // descriptor to serve on GET_DESCRIPTOR(REPORT). For non-HID
+    // classes either pass class_desc null or provide whatever the
+    // class spec mandates; report_desc can be null.
+    //
+
+    // Returns a usb device handle (opaque), or 0 on failure.
+    public static native long usb_dev_attach(
+            long machine,
+            short vid,
+            short pid,
+            byte  classCode,
+            byte  subclass,
+            byte  protocol,
+            String manufacturer,
+            String product,
+            String serial,
+            byte[]  epAddresses,
+            byte[]  epTypes,   /* 0=control 1=iso 2=bulk 3=interrupt */
+            short[] epSizes,
+            byte    classDescType,  /* 0x21 for HID, 0 to suppress */
+            byte[]  classDesc,      /* embedded in config descriptor; null for none */
+            byte[]  reportDesc      /* served on GET_DESCRIPTOR(type=0x22); null for none */
+    );
+
+    public static native void usb_dev_detach(long handle);
+
+    // Push one packet toward the guest on an IN endpoint. Returns
+    // bytes accepted (may drop oldest if the queue is full).
+    public static native int usb_ep_feed(long handle, byte ep, byte[] data, int off, int len);
+
+    // Drain one packet the guest wrote to an OUT endpoint. Returns
+    // bytes written into out, 0 if empty.
+    public static native int usb_ep_poll(long handle, byte ep, byte[] out);
+
+    // Fill a long[6] with {in_fed, in_consumed, out_pushed, out_popped,
+    // in_dropped, out_dropped}.
+    public static native void usb_dev_stats(long handle, long[] out);
 }
