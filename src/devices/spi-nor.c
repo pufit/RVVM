@@ -30,6 +30,10 @@ PUSH_OPTIMIZATION_SIZE
 #define CMD_WRSR3      0x11  // Write Status Register 3
 #define CMD_READ       0x03  // Read Data
 #define CMD_FAST_READ  0x0B  // Fast Read
+#define CMD_DOR        0x3B  // Dual Output Fast Read   (1-1-2)
+#define CMD_QOR        0x6B  // Quad Output Fast Read   (1-1-4)
+#define CMD_DIOR       0xBB  // Dual I/O Fast Read      (1-2-2)
+#define CMD_QIOR       0xEB  // Quad I/O Fast Read      (1-4-4)
 #define CMD_PP         0x02  // Page Program
 #define CMD_SE         0x20  // Sector Erase (4 KB)
 #define CMD_BE32       0x52  // Block Erase (32 KB)
@@ -289,13 +293,37 @@ static uint8_t spi_nor_transfer(void* dev, uint8_t tx)
             return b;
         }
 
-        case CMD_FAST_READ: {
-            // Like READ but with 1 dummy byte after the address.
+        case CMD_FAST_READ:
+        case CMD_DOR:
+        case CMD_QOR:
+        case CMD_DIOR:
+        case CMD_QIOR: {
+            // All four "fast read" variants share the same byte-level layout
+            // from the slave's POV — only the filler-byte count between the
+            // 24-bit address and the data stream differs. Lane width is
+            // invisible here: dual/quad just clock more bits per cycle on
+            // the wire, but TXDATA/RXDATA still hand us one byte per frame.
+            //
+            //   0x0B FAST_READ   : addr(3) + dummy(1)            + data
+            //   0x3B DOR  (1-1-2): addr(3) + dummy(1)            + data
+            //   0x6B QOR  (1-1-4): addr(3) + dummy(1)            + data
+            //   0xBB DIOR (1-2-2): addr(3) + mode(1)             + data
+            //   0xEB QIOR (1-4-4): addr(3) + mode(1) + dummy(2)  + data
+            //
+            // The mode byte is consumed but ignored — continuous-read mode
+            // (where M[5:4]=0b10 lets the next transaction skip the cmd
+            // phase) isn't enabled by Linux's spi-nor core on this path.
+            uint32_t fillers;
+            switch (nor->cmd) {
+                case CMD_DIOR: fillers = 1; break;  // mode only
+                case CMD_QIOR: fillers = 3; break;  // mode + 2 dummy
+                default:       fillers = 1; break;  // 1 dummy byte
+            }
             if (i < 3) {
                 nor->addr = (nor->addr << 8) | tx;
                 return 0xFF;
             }
-            if (i == 3) return 0xFF;  // dummy cycle
+            if (i < 3 + fillers) return 0xFF;
             uint8_t b = 0xFF;
             rvread(nor->file, &b, 1, nor->addr);
             nor->addr = (uint32_t)(((uint64_t)nor->addr + 1u) % nor->size);
