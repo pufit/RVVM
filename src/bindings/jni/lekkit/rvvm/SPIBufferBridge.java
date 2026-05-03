@@ -35,9 +35,9 @@ package lekkit.rvvm;
  * <p>The bridge is freed automatically when its owning machine is
  * freed — do not hold a handle past the machine's lifetime.
  */
-public class SPIBufferBridge {
+public class SPIBufferBridge implements IRemovableDevice {
     private final RVVMMachine machine;
-    private final long handle;
+    private long handle;
 
     /**
      * Attach a SPI slave with an initial read buffer of {@code bufBytes}
@@ -52,6 +52,7 @@ public class SPIBufferBridge {
                 : 0;
     }
 
+    @Override
     public boolean isValid() {
         return machine.isValid() && handle != 0;
     }
@@ -97,5 +98,25 @@ public class SPIBufferBridge {
     public void stats(long[] out) {
         if (!isValid() || out == null || out.length < 4) return;
         RVVMNative.spi_buffer_bridge_stats(handle, out);
+    }
+
+    /**
+     * Hot-detach the slave from its CS line on the SiFive controller.
+     * Native side soft-flips the slave to "absent" (in-flight transfers
+     * return {@code 0xFF} and stop capturing MOSI), then clears the bus
+     * slot — which fires the slave's remove hook and frees the native
+     * memory backing this handle. The SiFive controller stays attached;
+     * the freed CS line behaves like an unpopulated slot.
+     *
+     * <p>After this call, {@link #isValid()} returns {@code false} and
+     * subsequent setBuffer / setByte / poll / stats calls become silent
+     * no-ops. Calling {@code remove()} twice is safe.
+     */
+    @Override
+    public void remove() {
+        long h = handle;
+        if (h == 0) return;
+        handle = 0;
+        RVVMNative.spi_buffer_bridge_detach(h);
     }
 }

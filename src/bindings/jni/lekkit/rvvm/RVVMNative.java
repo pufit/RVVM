@@ -324,6 +324,18 @@ public class RVVMNative {
     // Fills long[4] with {total_reads, total_writes, writes_dropped, ring_occupancy}.
     public static native void i2c_sensor_bridge_stats(long handle, long[] out);
 
+    // Hot-detach the slave from the bus. Soft-NACKs in-flight transactions,
+    // then asks the bus to vector-erase the slot — fires the slave's remove
+    // hook (frees the handle's native memory). After this call the handle
+    // is invalid; do not pass it to any other i2c_sensor_bridge_* call.
+    // Idempotent on handle == 0.
+    public static native void i2c_sensor_bridge_detach(long handle);
+
+    // Returns the I2C address i2c_attach_dev assigned at init time (useful
+    // when init was called with addr=0 and the JVM needs the actual bus
+    // address, e.g. to drive a sysfs `new_device` binding).
+    public static native int  i2c_sensor_bridge_addr(long handle);
+
     //
     // USB device bridge
     //
@@ -411,6 +423,15 @@ public class RVVMNative {
 
     // Fills long[4] with {total_transfers, writes_dropped, ring_occupancy, cursor}.
     public static native void spi_buffer_bridge_stats(long handle, long[] out);
+
+    // Hot-detach the SPI slave from its CS line on the controller's bus.
+    // Soft-flips the slave to "absent" (in-flight transfers return 0xFF
+    // and stop capturing MOSI), then clears the bus slot — fires the
+    // slave's remove hook and frees the handle's native memory. The
+    // SiFive controller itself stays attached; the freed CS line behaves
+    // like an unpopulated slot. After this call the handle is invalid.
+    // Idempotent on handle == 0.
+    public static native void spi_buffer_bridge_detach(long handle);
 
     //
     // Generic shadow MMIO JNI bridge

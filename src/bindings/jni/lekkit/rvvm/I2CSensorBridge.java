@@ -48,24 +48,25 @@ package lekkit.rvvm;
  * (typically via {@link RVVMNative#i2c_bus_init_auto(long)}). Bridge
  * is freed automatically when its owning machine is freed.
  */
-public class I2CSensorBridge {
+public class I2CSensorBridge implements IRemovableDevice {
     /** Address of an 8-bit shadow register file. */
     public static final int SHADOW_BYTES = 256;
 
     private final RVVMMachine machine;
-    private final long handle;
-    private final int  addr;
+    private long handle;
+    private final int  requestedAddr;
 
     /**
      * Attach a sensor at I2C address {@code addr}. Pass 0 to auto-pick
      * the next free address starting at 0x08.
      */
     public I2CSensorBridge(RVVMMachine machine, int addr) {
-        this.machine = machine;
-        this.handle  = machine.isValid() ? RVVMNative.i2c_sensor_bridge_init(machine.getPtr(), addr) : 0;
-        this.addr    = addr;
+        this.machine       = machine;
+        this.handle        = machine.isValid() ? RVVMNative.i2c_sensor_bridge_init(machine.getPtr(), addr) : 0;
+        this.requestedAddr = addr;
     }
 
+    @Override
     public boolean isValid() {
         return machine.isValid() && handle != 0;
     }
@@ -74,9 +75,26 @@ public class I2CSensorBridge {
         return machine;
     }
 
-    /** Configured I2C address (0 if auto-picked — query the controller for the actual). */
+    /**
+     * Address originally requested at construction time (0 if the caller
+     * asked for auto-pick). For the bus address actually assigned by the
+     * bus controller, see {@link #getAssignedAddr()}.
+     */
     public int getAddr() {
-        return addr;
+        return requestedAddr;
+    }
+
+    /**
+     * The I2C address the bus actually assigned to this slave. Resolves
+     * a {@code new I2CSensorBridge(m, 0)} auto-pick — useful when the
+     * JVM needs to tell guest userspace where to find the slave (e.g.
+     * via a sysfs {@code new_device} write to the i2c-dev binding).
+     * Returns 0 if the bridge failed to attach or has already been
+     * detached.
+     */
+    public int getAssignedAddr() {
+        if (handle == 0) return 0;
+        return RVVMNative.i2c_sensor_bridge_addr(handle);
     }
 
     /**
@@ -117,5 +135,25 @@ public class I2CSensorBridge {
     public void stats(long[] out) {
         if (!isValid() || out == null || out.length < 4) return;
         RVVMNative.i2c_sensor_bridge_stats(handle, out);
+    }
+
+    /**
+     * Hot-detach the slave from the I2C bus. The native side first
+     * soft-NACKs the slave (any in-flight transaction sees start /
+     * read / write return false), then asks the bus to vector-erase the
+     * slot — which fires the slave's remove hook and frees the native
+     * memory backing this handle.
+     *
+     * <p>After this call, {@link #isValid()} returns {@code false} and
+     * subsequent calls to set / setBulk / pollWrites / stats become
+     * silent no-ops. Calling {@code remove()} twice is safe (the second
+     * call is a no-op).
+     */
+    @Override
+    public void remove() {
+        long h = handle;
+        if (h == 0) return;
+        handle = 0;
+        RVVMNative.i2c_sensor_bridge_detach(h);
     }
 }

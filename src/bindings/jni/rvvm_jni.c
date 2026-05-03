@@ -1561,7 +1561,11 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1stats(JNIE
 #define JNI_I2C_RING_BYTES  128 // 64 (addr,val) write events buffered
 
 typedef struct {
-    spinlock_t lock;
+    spinlock_t  lock;
+    i2c_bus_t*  bus;            // owning bus, captured for detach
+    uint16_t    assigned_addr;  // address i2c_attach_dev returned
+    bool        absent;         // soft-detach gate; start/read/write NACK when set
+
     uint8_t    regs[JNI_I2C_REG_BYTES]; // shadow visible to guest reads
     uint8_t    cursor;                  // current register pointer
     bool       awaiting_addr;           // true between start(write) and first write byte
@@ -1576,6 +1580,7 @@ static bool jni_i2c_start(void* dev, bool is_write)
 {
     jni_i2c_bridge_t* b = dev;
     scoped_spin_lock (&b->lock) {
+        if (b->absent) return false;
         // Only writes need the address-byte gate; reads continue from the
         // last cursor (set by a previous write transaction).
         b->awaiting_addr = is_write;
@@ -1587,6 +1592,7 @@ static bool jni_i2c_write(void* dev, uint8_t byte)
 {
     jni_i2c_bridge_t* b = dev;
     scoped_spin_lock (&b->lock) {
+        if (b->absent) return false;
         if (b->awaiting_addr) {
             b->cursor = byte;
             b->awaiting_addr = false;
@@ -1611,6 +1617,7 @@ static bool jni_i2c_read(void* dev, uint8_t* byte)
 {
     jni_i2c_bridge_t* b = dev;
     scoped_spin_lock (&b->lock) {
+        if (b->absent) return false;
         *byte = b->regs[b->cursor];
         b->cursor++;
         b->total_reads += 1;
@@ -1669,7 +1676,60 @@ JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1init(JN
         free(b);
         return 0;
     }
+    // Cache bus + assigned address for detach; the JVM-side handle is the
+    // only thing that knows where on the bus this slave landed when addr=0.
+    b->bus           = bus;
+    b->assigned_addr = assigned;
     return (jlong)(size_t)b;
+}
+
+/*
+ * Hot-detach a previously attached I2C sensor bridge. Soft-NACKs the
+ * slave first (any in-flight transaction sees start/read/write return
+ * false from this point on), then asks the bus to vector-erase the
+ * slot, which fires jni_i2c_remove and frees the bridge struct.
+ *
+ * After this call the handle is invalid; callers must drop their
+ * reference and not pass it to any other RVVMNative.i2c_sensor_bridge_*
+ * call. Idempotent on null handle. Calling twice on the same handle is
+ * UB (the second call dereferences freed memory).
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1detach(JNIEnv* env, jclass cls, //
+                                                                                jlong handle)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return;
+    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
+    i2c_bus_t* bus;
+    uint16_t   addr;
+    scoped_spin_lock (&b->lock) {
+        if (b->absent) return; // already in flight
+        b->absent = true;
+        bus  = b->bus;
+        addr = b->assigned_addr;
+    }
+    // i2c_detach_dev fires the slave's remove hook (jni_i2c_remove ->
+    // ringbuf_destroy + free(b)), so b is dangling once this returns.
+    // We've already extracted bus/addr to locals so we never touch b
+    // after the call.
+    i2c_detach_dev(bus, addr);
+}
+
+/*
+ * Query the address i2c_attach_dev assigned. Useful when init was called
+ * with addr=0 and the JVM wants to surface the actual bus address (e.g.
+ * to set up a guest-side i2c-dev binding via /sys/bus/i2c/.../new_device).
+ * Returns 0 on null handle.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1addr(JNIEnv* env, jclass cls, //
+                                                                              jlong handle)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return 0;
+    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
+    return (jint)b->assigned_addr;
 }
 
 /*
@@ -1795,6 +1855,10 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1stats(JN
 
 typedef struct {
     spinlock_t lock;
+    spi_bus_t* bus;             // owning bus, captured for detach
+    uint16_t   assigned_cs;     // cs_id spi_attach_dev returned
+    bool       absent;          // soft-detach gate; transfers return 0xFF when set
+
     uint8_t*   read_buf;        // Java-managed MISO data
     size_t     read_buf_size;
     size_t     cursor;          // index into read_buf for the next transfer
@@ -1809,6 +1873,7 @@ static void jni_spi_select(void* dev, bool asserted)
     jni_spi_bridge_t* b = dev;
     if (!asserted) return;
     scoped_spin_lock (&b->lock) {
+        if (b->absent) return;
         b->cursor = 0;
     }
 }
@@ -1818,6 +1883,10 @@ static uint8_t jni_spi_transfer(void* dev, uint8_t tx)
     jni_spi_bridge_t* b = dev;
     uint8_t           out = 0xFF;
     scoped_spin_lock (&b->lock) {
+        // Soft-detached: float MISO high and don't capture MOSI either.
+        // The slave is on its way out of the bus's slot table; the JVM
+        // already stopped watching the write ring.
+        if (b->absent) return 0xFF;
         if (b->read_buf_size > 0) {
             out = b->read_buf[b->cursor];
             b->cursor++;
@@ -1874,14 +1943,60 @@ JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1init(JN
         .transfer = jni_spi_transfer,
         .remove   = jni_spi_remove,
     };
-    if (spi_attach_dev(spi_sifive_get_bus(spi_mmio), &desc) == SPI_AUTO_CS) {
+    spi_bus_t* spi_bus = spi_sifive_get_bus(spi_mmio);
+    uint16_t   cs      = spi_attach_dev(spi_bus, &desc);
+    if (cs == SPI_AUTO_CS) {
         rvvm_error("SPI buffer bridge: spi_attach_dev failed");
         free(b->read_buf);
         ringbuf_destroy(&b->writes);
         free(b);
         return 0;
     }
+    // Cache bus + assigned CS for detach. Note: the SPI controller (and
+    // its bus) live as long as the machine — there's no way to detach the
+    // controller itself, only the slave we hung off it. The freed CS slot
+    // becomes a floating MISO line again until something re-attaches.
+    b->bus         = spi_bus;
+    b->assigned_cs = cs;
     return (jlong)(size_t)b;
+}
+
+/*
+ * Hot-detach a previously attached SPI buffer bridge. Soft-flips the
+ * `absent` gate first so any in-flight transfer through the controller's
+ * MMIO worker returns 0xFF and stops capturing MOSI; then asks the bus
+ * to clear the slot, which fires jni_spi_remove (frees read_buf, ring,
+ * and the bridge struct).
+ *
+ * The SiFive controller itself is not detached — it stays attached to
+ * the machine and continues to advertise its CS pin count. The freed
+ * slot is now an unpopulated CS line: selects are no-ops, transfers
+ * return 0xFF, matching real hardware with that CS pin pulled high
+ * with no slave on the other end.
+ *
+ * After this call the handle is invalid; callers must drop their
+ * reference and not pass it to any other RVVMNative.spi_buffer_bridge_*
+ * call. Idempotent on null handle. Calling twice on the same handle is
+ * UB.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1detach(JNIEnv* env, jclass cls, //
+                                                                                jlong handle)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return;
+    jni_spi_bridge_t* b = (jni_spi_bridge_t*)(size_t)handle;
+    spi_bus_t* bus;
+    uint16_t   cs;
+    scoped_spin_lock (&b->lock) {
+        if (b->absent) return;
+        b->absent = true;
+        bus = b->bus;
+        cs  = b->assigned_cs;
+    }
+    // spi_detach_dev fires jni_spi_remove which frees b. After this
+    // returns, b is dangling — locals only from here on.
+    spi_detach_dev(bus, cs);
 }
 
 /*
