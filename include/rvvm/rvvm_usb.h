@@ -228,9 +228,9 @@ RVVM_PUBLIC rvvm_usb_dev_t* rvvm_usb_dev_init_at(rvvm_usb_bus_t*            bus,
  * \param data USB device private data
  * \return USB device handle or NULL
  */
-RVVM_PUBLIC rvvm_usb_dev_t* rvvm_usb_dev_init(rvvm_usb_bus_t*            bus,  /**/
-                                              const rvvm_usb_dev_type_t* type, /**/
-                                              void*                      data)
+static inline rvvm_usb_dev_t* rvvm_usb_dev_init(rvvm_usb_bus_t*            bus,  /**/
+                                                const rvvm_usb_dev_type_t* type, /**/
+                                                void*                      data)
 {
     return rvvm_usb_dev_init_at(bus, type, data, RVVM_USB_PORT_ANY);
 }
@@ -392,6 +392,26 @@ RVVM_PUBLIC void rvvm_usb_dev_reset(rvvm_usb_dev_t* dev);
  * \param resume Deserialize and resume processing
  */
 RVVM_PUBLIC void rvvm_usb_dev_suspend(rvvm_usb_dev_t* dev, rvvm_snapshot_t* snap, bool resume);
+
+/**
+ * Synthesize a standard (Chapter 9) control response from the device's
+ * rvvm_usb_dev_prod_t. Exposed as a public helper so custom control
+ * callbacks can handle class/vendor requests themselves and delegate
+ * standard ones here instead of re-implementing descriptor serialization.
+ *
+ * Returns RVVM_USB_XFER_STALL for class/vendor requests, unknown
+ * standard requests, or when the device has no product description.
+ *
+ * \param dev   USB device handle (must have type->prod non-NULL)
+ * \param setup USB setup packet (8 bytes)
+ * \param data  Data buffer or NULL for no data stage
+ * \param size  Buffer size (IN) or data length (OUT)
+ * \return Bytes transferred (>= 0) or RVVM_USB_XFER_* code
+ */
+RVVM_PUBLIC int32_t rvvm_usb_std_control(rvvm_usb_dev_t* dev,   /**/
+                                         const void*     setup, /**/
+                                         void*           data,  /**/
+                                         size_t          size);
 
 /** @}*/
 

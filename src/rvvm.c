@@ -1029,6 +1029,21 @@ PUBLIC void rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus)
     }
 }
 
+PUBLIC rvvm_usb_bus_t* rvvm_get_usb_bus(rvvm_machine_t* machine)
+{
+    if (likely(machine)) {
+        return machine->usb_bus;
+    }
+    return NULL;
+}
+
+PUBLIC void rvvm_set_usb_bus(rvvm_machine_t* machine, rvvm_usb_bus_t* usb_bus)
+{
+    if (machine && usb_bus) {
+        machine->usb_bus = usb_bus;
+    }
+}
+
 PUBLIC struct fdt_node* rvvm_get_fdt_root(rvvm_machine_t* machine)
 {
 #if defined(USE_FDT)

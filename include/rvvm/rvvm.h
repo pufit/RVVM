@@ -293,6 +293,16 @@ RVVM_PUBLIC i2c_bus_t* rvvm_get_i2c_bus(rvvm_machine_t* machine);
 RVVM_PUBLIC void       rvvm_set_i2c_bus(rvvm_machine_t* machine, i2c_bus_t* i2c_bus);
 
 /**
+ * Get USB bus handle of this machine, or NULL.
+ *
+ * Devices attach via rvvm_usb_dev_init / rvvm_usb_dev_init_at; the host
+ * controller (e.g. XHCI) services them and translates between the USB
+ * protocol and guest MMIO.
+ */
+RVVM_PUBLIC rvvm_usb_bus_t* rvvm_get_usb_bus(rvvm_machine_t* machine);
+RVVM_PUBLIC void            rvvm_set_usb_bus(rvvm_machine_t* machine, rvvm_usb_bus_t* usb_bus);
+
+/**
  * Get root FDT node (For FDT device description generation)
  */
 RVVM_PUBLIC rvvm_fdt_node_t* rvvm_get_fdt_root(rvvm_machine_t* machine);

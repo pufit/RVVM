@@ -299,9 +299,10 @@ struct randomize_layout rvvm_machine_t {
     rvfile_t* kernel_file;
     rvfile_t* fdt_file;
 
-    rvvm_intc_t* intc;
-    pci_bus_t*   pci_bus;
-    i2c_bus_t*   i2c_bus;
+    rvvm_intc_t*    intc;
+    pci_bus_t*      pci_bus;
+    i2c_bus_t*      i2c_bus;
+    rvvm_usb_bus_t* usb_bus;
 
     gdb_server_t* gdbstub;
 

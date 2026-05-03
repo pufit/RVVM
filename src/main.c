@@ -466,7 +466,9 @@ static int rvvm_cli_main(int argc, char** argv)
     pci_bus_init_auto(machine);
     i2c_oc_init_auto(machine);
 
-    // usb_xhci_init(rvvm_get_pci_bus(machine));
+    if (!rvvm_has_arg("nousb")) {
+        usb_xhci_init_auto(machine);
+    }
 
     rtc_goldfish_init_auto(machine);
     syscon_init_auto(machine);
