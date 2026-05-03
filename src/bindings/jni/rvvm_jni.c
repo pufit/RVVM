@@ -46,6 +46,64 @@
 
 PUSH_OPTIMIZATION_SIZE
 
+/*
+ * Cached JavaVM* for upcalls from RVVM-spawned threads (CPU/hart threads
+ * that call into the I2C device bridge). Captured lazily from the first
+ * env we see; the value is stable for the process lifetime, so a torn
+ * write of an aligned pointer is benign — every writer stores the same
+ * address. No init order dependency on JNI_OnLoad.
+ *
+ * Used only by the I2C device bridge today; if other upcall callers
+ * appear, share this single global rather than each path caching its
+ * own.
+ */
+static JavaVM* g_jni_jvm = NULL;
+
+static void jni_capture_jvm(JNIEnv* env)
+{
+    if (g_jni_jvm == NULL && env != NULL) {
+        JavaVM* vm = NULL;
+        (*env)->GetJavaVM(env, &vm);
+        g_jni_jvm = vm;
+    }
+}
+
+/*
+ * Get a JNIEnv* for the current thread, attaching as a daemon if the
+ * thread isn't already known to the JVM. Returns NULL if the JavaVM
+ * pointer hasn't been captured yet (no init has run on this process)
+ * or if attach fails.
+ *
+ * RVVM's CPU/hart threads aren't created by the JVM but they execute
+ * MMIO dispatch which routes into our slave callbacks. For those to
+ * call back into the JVM, we attach on first contact and stay attached
+ * for the thread's lifetime. AttachCurrentThreadAsDaemon (vs the
+ * non-daemon variant) ensures the thread doesn't block JVM shutdown
+ * if the machine is still running when the JVM tears down.
+ */
+static JNIEnv* jni_env_for_upcall(void)
+{
+    JavaVM* vm = g_jni_jvm;
+    if (vm == NULL) return NULL;
+    JNIEnv* env = NULL;
+    jint    rc  = (*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6);
+    if (rc == JNI_OK) return env;
+    if (rc == JNI_EDETACHED) {
+        if ((*vm)->AttachCurrentThreadAsDaemon(vm, (void**)&env, NULL) == JNI_OK) {
+            return env;
+        }
+    }
+    return NULL;
+}
+
+static void jni_clear_pending_exception(JNIEnv* env)
+{
+    if (env != NULL && (*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    }
+}
+
 JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_check_1abi(JNIEnv* env, jclass cls, //
                                                                   jint abi)
 {
@@ -1526,302 +1584,233 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_can_1node_1bridge_1stats(JNIE
 }
 
 /*
- * I2C sensor JNI bridge — read-shadow register file
+ * I2C device JNI bridge — synchronous Java-side device callbacks
  *
- * Attaches a 256-byte shadow-register I2C slave the guest can read like
- * any SMBus / I2C peripheral (sensor, EEPROM, IO expander). The slave's
- * read callback hands back bytes from a Java-managed shadow; the slave's
- * write callback captures (register, value) events into a ring the JVM
- * drains on tick. No C→Java upcalls — the cost of read latency is one
- * memcpy from the shadow.
+ * Attaches a slave to the machine's I2C bus whose start / write / read /
+ * stop callbacks are dispatched into a Java {@code I2CDevice} handler.
+ * Each guest transaction step crosses the JNI boundary once, on the CPU
+ * thread that runs the i2c-oc MMIO dispatch.
  *
- * Transaction model (matches the typical "set cursor, then read/write"
- * SMBus pattern):
+ * This subsumes the previous shadow-register sensor bridge: the shadow
+ * pattern is now expressed as a Java class ({@code ShadowRegisterI2CDevice})
+ * implementing the same callback contract. One C-side primitive, every
+ * device shape — sensors, EEPROMs with paged cursors, ADCs whose response
+ * depends on the request, command/response state machines — written in
+ * Java with whatever per-transaction logic the device demands.
  *
- *   - start(is_write=true), write(byte) → first byte sets the cursor
- *     register; subsequent bytes write shadow[cursor++] AND emit
- *     (cursor, byte) into the write-event ring.
- *   - start(is_write=false), read() → returns shadow[cursor]; cursor++.
- *   - stop() finalises the transaction; the cursor persists across
- *     transactions (some devices reset, but most stick — and userspace
- *     drivers that care set the cursor explicitly anyway).
+ * Threading. i2c-oc holds the bus spinlock during dispatch and serialises
+ * detach against it, so the bus guarantees the slot is present-or-erased
+ * around every callback. No bridge-side gate needed: a CPU thread that
+ * entered the slave callback is already past the bus lock, and detach
+ * (i2c_detach_dev) waits behind that same lock before firing remove.
  *
- * Shadow file: 256 bytes. Covers any peripheral with an 8-bit register
- * address space, which is essentially every SMBus device and most I2C
- * sensors. Larger register spaces (16-bit address EEPROMs etc.) need a
- * different bridge type — out of scope here.
+ * The Java handler MUST NOT issue I2C transactions back into the same
+ * machine from inside its callback — the bus lock is held, and
+ * re-entering would deadlock. Anything else (allocations, cross-thread
+ * publishes, blocking on JVM monitors that don't transitively wait on
+ * the CPU thread) is fine, modulo the usual "you're stalling guest CPU
+ * for the duration of this call" performance caveat.
  *
- * Threading: i2c-oc dispatches start/write/read/stop on the I2C
- * controller's MMIO-write thread. The shadow array and write ring are
- * spinlock-guarded; Java-side set/poll lock the same spinlock. The
- * slave never blocks (no callbacks into Java from start/write/read/stop).
+ * Exception policy. If the Java handler throws, the exception is
+ * described to stderr, cleared, and the callback returns false (NACK)
+ * or -1 / 0xFF as appropriate. The slave stays attached — the next
+ * transaction tries again.
  */
 
-#define JNI_I2C_REG_BYTES   256
-#define JNI_I2C_RING_BYTES  128 // 64 (addr,val) write events buffered
-
 typedef struct {
-    spinlock_t  lock;
-    i2c_bus_t*  bus;            // owning bus, captured for detach
-    uint16_t    assigned_addr;  // address i2c_attach_dev returned
-    bool        absent;         // soft-detach gate; start/read/write NACK when set
+    i2c_bus_t* bus;            // owning bus, captured for detach
+    uint16_t   assigned_addr;  // address i2c_attach_dev returned
+    jobject    handler;        // global ref to the Java I2CDevice
+    jmethodID  start_id;       // boolean start(boolean isWrite)
+    jmethodID  write_id;       // boolean write(byte b)
+    jmethodID  read_id;        // int read()  // -1 = NACK, else byte & 0xFF
+    jmethodID  stop_id;        // void stop()
+} jni_i2c_dev_bridge_t;
 
-    uint8_t    regs[JNI_I2C_REG_BYTES]; // shadow visible to guest reads
-    uint8_t    cursor;                  // current register pointer
-    bool       awaiting_addr;           // true between start(write) and first write byte
-    ringbuf_t  writes;                  // (addr, byte) pairs the guest wrote
-
-    uint64_t   total_reads;
-    uint64_t   total_writes;
-    uint64_t   writes_dropped;
-} jni_i2c_bridge_t;
-
-static bool jni_i2c_start(void* dev, bool is_write)
+static bool jni_i2c_dev_start(void* dev, bool is_write)
 {
-    jni_i2c_bridge_t* b = dev;
-    scoped_spin_lock (&b->lock) {
-        if (b->absent) return false;
-        // Only writes need the address-byte gate; reads continue from the
-        // last cursor (set by a previous write transaction).
-        b->awaiting_addr = is_write;
+    jni_i2c_dev_bridge_t* b = dev;
+    JNIEnv* env = jni_env_for_upcall();
+    if (env == NULL) return false;
+    jboolean r = (*env)->CallBooleanMethod(env, b->handler, b->start_id,
+                                           is_write ? JNI_TRUE : JNI_FALSE);
+    if ((*env)->ExceptionCheck(env)) {
+        jni_clear_pending_exception(env);
+        return false;
     }
+    return r == JNI_TRUE;
+}
+
+static bool jni_i2c_dev_write(void* dev, uint8_t byte)
+{
+    jni_i2c_dev_bridge_t* b = dev;
+    JNIEnv* env = jni_env_for_upcall();
+    if (env == NULL) return false;
+    jboolean r = (*env)->CallBooleanMethod(env, b->handler, b->write_id, (jbyte)byte);
+    if ((*env)->ExceptionCheck(env)) {
+        jni_clear_pending_exception(env);
+        return false;
+    }
+    return r == JNI_TRUE;
+}
+
+static bool jni_i2c_dev_read(void* dev, uint8_t* byte)
+{
+    jni_i2c_dev_bridge_t* b = dev;
+    JNIEnv* env = jni_env_for_upcall();
+    if (env == NULL) return false;
+    jint r = (*env)->CallIntMethod(env, b->handler, b->read_id);
+    if ((*env)->ExceptionCheck(env)) {
+        jni_clear_pending_exception(env);
+        return false;
+    }
+    if (r < 0) return false; // explicit NACK
+    *byte = (uint8_t)(r & 0xFF);
     return true;
 }
 
-static bool jni_i2c_write(void* dev, uint8_t byte)
+static void jni_i2c_dev_stop(void* dev)
 {
-    jni_i2c_bridge_t* b = dev;
-    scoped_spin_lock (&b->lock) {
-        if (b->absent) return false;
-        if (b->awaiting_addr) {
-            b->cursor = byte;
-            b->awaiting_addr = false;
-            return true;
-        }
-        b->regs[b->cursor] = byte;
-        // Emit (addr, byte) event. Drop oldest if full.
-        if (ringbuf_space(&b->writes) < 2) {
-            uint8_t junk[2];
-            ringbuf_read(&b->writes, junk, 2);
-            b->writes_dropped += 2;
-        }
-        uint8_t evt[2] = { b->cursor, byte };
-        ringbuf_write(&b->writes, evt, 2);
-        b->total_writes += 2;
-        b->cursor++; // wraps at 256, matches typical 8-bit-cursor devices
+    jni_i2c_dev_bridge_t* b = dev;
+    JNIEnv* env = jni_env_for_upcall();
+    if (env == NULL) return;
+    (*env)->CallVoidMethod(env, b->handler, b->stop_id);
+    if ((*env)->ExceptionCheck(env)) {
+        jni_clear_pending_exception(env);
     }
-    return true;
 }
 
-static bool jni_i2c_read(void* dev, uint8_t* byte)
+static void jni_i2c_dev_remove(void* dev)
 {
-    jni_i2c_bridge_t* b = dev;
-    scoped_spin_lock (&b->lock) {
-        if (b->absent) return false;
-        *byte = b->regs[b->cursor];
-        b->cursor++;
-        b->total_reads += 1;
+    jni_i2c_dev_bridge_t* b = dev;
+    JNIEnv* env = jni_env_for_upcall();
+    if (env != NULL && b->handler != NULL) {
+        (*env)->DeleteGlobalRef(env, b->handler);
     }
-    return true;
-}
-
-static void jni_i2c_stop(void* dev)
-{
-    UNUSED(dev);
-    // Cursor and shadow persist across transactions — nothing to do.
-}
-
-static void jni_i2c_remove(void* dev)
-{
-    jni_i2c_bridge_t* b = dev;
-    ringbuf_destroy(&b->writes);
     free(b);
 }
 
 /*
- * Attach a sensor-style slave to the machine's I2C bus at `addr`. Pass
- * 0 for `addr` to auto-pick. Requires the machine to have an I2C bus
- * already attached (i2c_bus_init_auto). Returns the bridge handle, or
- * 0 on failure; the assigned address is reflected in stats via the
- * separate i2c_sensor_bridge_addr accessor.
+ * Attach a Java-driven I2C slave at `addr` (0 = auto-pick). The handler
+ * must implement the {@code lekkit.rvvm.I2CDevice} interface; missing
+ * methods on the runtime class cause attach to fail (returns 0). The
+ * machine must already have an I2C bus (i2c_bus_init_auto).
+ *
+ * Returns an opaque bridge handle or 0 on failure. Pass the handle to
+ * i2c_dev_bridge_detach to hot-remove the slave; freeing the machine
+ * also fires the slave's remove hook (DeleteGlobalRef + free(b)) via
+ * the bus's vector teardown.
  */
-JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1init(JNIEnv* env, jclass cls, //
-                                                                              jlong machine, jint addr)
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1dev_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                            jlong machine, jint addr,
+                                                                            jobject handler)
 {
-    UNUSED(env);
     UNUSED(cls);
     rvvm_machine_t* m = (rvvm_machine_t*)(size_t)machine;
+    if (handler == NULL) {
+        rvvm_error("I2C dev bridge: handler is null");
+        return 0;
+    }
     i2c_bus_t* bus = rvvm_get_i2c_bus(m);
     if (bus == NULL) {
-        rvvm_error("I2C sensor bridge: machine has no I2C bus — call i2c_bus_init_auto first");
+        rvvm_error("I2C dev bridge: machine has no I2C bus — call i2c_bus_init_auto first");
         return 0;
     }
 
-    jni_i2c_bridge_t* b = safe_new_obj(jni_i2c_bridge_t);
-    ringbuf_create(&b->writes, JNI_I2C_RING_BYTES);
+    jni_capture_jvm(env);
+
+    // Resolve I2CDevice methods against the handler's runtime class —
+    // GetMethodID picks up the impl through virtual dispatch when the
+    // callback fires. Defaulted interface methods (stop) resolve fine.
+    jclass dev_class = (*env)->GetObjectClass(env, handler);
+    if (dev_class == NULL) {
+        rvvm_error("I2C dev bridge: GetObjectClass failed");
+        return 0;
+    }
+    jmethodID start_id = (*env)->GetMethodID(env, dev_class, "start", "(Z)Z");
+    jmethodID write_id = (*env)->GetMethodID(env, dev_class, "write", "(B)Z");
+    jmethodID read_id  = (*env)->GetMethodID(env, dev_class, "read",  "()I");
+    jmethodID stop_id  = (*env)->GetMethodID(env, dev_class, "stop",  "()V");
+    (*env)->DeleteLocalRef(env, dev_class);
+    if (start_id == NULL || write_id == NULL || read_id == NULL || stop_id == NULL) {
+        // GetMethodID set a NoSuchMethodError already — clear it and
+        // surface our own context. The JVM caller sees a 0 handle which
+        // its wrapper translates into !isValid().
+        jni_clear_pending_exception(env);
+        rvvm_error("I2C dev bridge: handler is missing one of "
+                   "start(Z)Z / write(B)Z / read()I / stop()V");
+        return 0;
+    }
+
+    jobject global = (*env)->NewGlobalRef(env, handler);
+    if (global == NULL) {
+        rvvm_error("I2C dev bridge: NewGlobalRef failed");
+        return 0;
+    }
+
+    jni_i2c_dev_bridge_t* b = safe_new_obj(jni_i2c_dev_bridge_t);
+    b->handler  = global;
+    b->start_id = start_id;
+    b->write_id = write_id;
+    b->read_id  = read_id;
+    b->stop_id  = stop_id;
 
     i2c_dev_t desc = {
         .addr   = (uint16_t)(addr & 0xFFFF),
         .data   = b,
-        .start  = jni_i2c_start,
-        .write  = jni_i2c_write,
-        .read   = jni_i2c_read,
-        .stop   = jni_i2c_stop,
-        .remove = jni_i2c_remove,
+        .start  = jni_i2c_dev_start,
+        .write  = jni_i2c_dev_write,
+        .read   = jni_i2c_dev_read,
+        .stop   = jni_i2c_dev_stop,
+        .remove = jni_i2c_dev_remove,
     };
     uint16_t assigned = i2c_attach_dev(bus, &desc);
     if (assigned == 0) {
-        rvvm_error("I2C sensor bridge: i2c_attach_dev failed (addr 0x%x)", (unsigned)addr);
-        ringbuf_destroy(&b->writes);
+        rvvm_error("I2C dev bridge: i2c_attach_dev failed (addr 0x%x)", (unsigned)addr);
+        (*env)->DeleteGlobalRef(env, global);
         free(b);
         return 0;
     }
-    // Cache bus + assigned address for detach; the JVM-side handle is the
-    // only thing that knows where on the bus this slave landed when addr=0.
     b->bus           = bus;
     b->assigned_addr = assigned;
     return (jlong)(size_t)b;
 }
 
 /*
- * Hot-detach a previously attached I2C sensor bridge. Soft-NACKs the
- * slave first (any in-flight transaction sees start/read/write return
- * false from this point on), then asks the bus to vector-erase the
- * slot, which fires jni_i2c_remove and frees the bridge struct.
+ * Hot-detach a previously attached I2C device bridge. Asks the bus to
+ * vector-erase the slot under the bus lock, which fires
+ * jni_i2c_dev_remove (DeleteGlobalRef + free(b)). i2c-oc serialises
+ * detach against in-flight callbacks via the bus lock, so a transfer
+ * already inside one of our upcalls completes before the bridge is
+ * torn down.
  *
- * After this call the handle is invalid; callers must drop their
- * reference and not pass it to any other RVVMNative.i2c_sensor_bridge_*
- * call. Idempotent on null handle. Calling twice on the same handle is
- * UB (the second call dereferences freed memory).
+ * After this call the handle is invalid. Idempotent on null handle;
+ * calling twice on the same handle is UB.
  */
-JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1detach(JNIEnv* env, jclass cls, //
-                                                                                jlong handle)
-{
-    UNUSED(env);
-    UNUSED(cls);
-    if (handle == 0) return;
-    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
-    i2c_bus_t* bus;
-    uint16_t   addr;
-    scoped_spin_lock (&b->lock) {
-        if (b->absent) return; // already in flight
-        b->absent = true;
-        bus  = b->bus;
-        addr = b->assigned_addr;
-    }
-    // i2c_detach_dev fires the slave's remove hook (jni_i2c_remove ->
-    // ringbuf_destroy + free(b)), so b is dangling once this returns.
-    // We've already extracted bus/addr to locals so we never touch b
-    // after the call.
-    i2c_detach_dev(bus, addr);
-}
-
-/*
- * Query the address i2c_attach_dev assigned. Useful when init was called
- * with addr=0 and the JVM wants to surface the actual bus address (e.g.
- * to set up a guest-side i2c-dev binding via /sys/bus/i2c/.../new_device).
- * Returns 0 on null handle.
- */
-JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1addr(JNIEnv* env, jclass cls, //
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1dev_1bridge_1detach(JNIEnv* env, jclass cls, //
                                                                               jlong handle)
 {
     UNUSED(env);
     UNUSED(cls);
-    if (handle == 0) return 0;
-    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
-    return (jint)b->assigned_addr;
+    if (handle == 0) return;
+    jni_i2c_dev_bridge_t* b = (jni_i2c_dev_bridge_t*)(size_t)handle;
+    // bus + assigned_addr are write-once at attach; safe to read without
+    // a lock. After i2c_detach_dev returns, b has been freed.
+    i2c_detach_dev(b->bus, b->assigned_addr);
 }
 
 /*
- * Update one shadow register. Visible to the next guest read at this
- * register address.
+ * Query the address i2c_attach_dev assigned (resolves the auto-pick
+ * case). Returns 0 on null handle.
  */
-JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1set(JNIEnv* env, jclass cls, //
-                                                                            jlong handle, jint reg, jint value)
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1dev_1bridge_1addr(JNIEnv* env, jclass cls, //
+                                                                            jlong handle)
 {
     UNUSED(env);
     UNUSED(cls);
-    if (handle == 0) return;
-    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
-    scoped_spin_lock (&b->lock) {
-        b->regs[reg & 0xFF] = (uint8_t)(value & 0xFF);
-    }
-}
-
-/*
- * Bulk shadow update. Copies `data[0..len)` into shadow[off..off+len),
- * wrapping at 256 if (off + len) overflows. Returns bytes written
- * (== len, capped at array length).
- */
-JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1set_1bulk(JNIEnv* env, jclass cls, //
-                                                                                   jlong handle, jint off,
-                                                                                   jbyteArray data)
-{
-    UNUSED(cls);
-    if (handle == 0 || data == NULL) return 0;
-    jni_i2c_bridge_t* b   = (jni_i2c_bridge_t*)(size_t)handle;
-    jsize             len = (*env)->GetArrayLength(env, data);
-    if (len <= 0) return 0;
-
-    jbyte* src = (*env)->GetByteArrayElements(env, data, NULL);
-    if (src == NULL) return 0;
-
-    scoped_spin_lock (&b->lock) {
-        // Wrap byte-by-byte to keep the math simple — bulk updates are
-        // typically <= 32 bytes (sensor sample frame), not perf-critical.
-        for (jsize i = 0; i < len; ++i) {
-            b->regs[(uint8_t)(off + i)] = (uint8_t)src[i];
-        }
-    }
-    (*env)->ReleaseByteArrayElements(env, data, src, JNI_ABORT);
-    return (jint)len;
-}
-
-/*
- * Drain queued (addr, value) write events. `out` length must be a
- * multiple of 2; returns the number of *events* drained (pairs), not
- * bytes.
- */
-JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1poll_1writes(JNIEnv* env, jclass cls, //
-                                                                                      jlong handle, jbyteArray out)
-{
-    UNUSED(cls);
-    if (handle == 0 || out == NULL) return 0;
-    jni_i2c_bridge_t* b   = (jni_i2c_bridge_t*)(size_t)handle;
-    jsize             cap = (*env)->GetArrayLength(env, out);
-    jsize             pairs = cap / 2;
-    if (pairs <= 0) return 0;
-
-    jbyte* buf = (*env)->GetByteArrayElements(env, out, NULL);
-    if (buf == NULL) return 0;
-
-    size_t got = 0;
-    scoped_spin_lock (&b->lock) {
-        got = ringbuf_read(&b->writes, buf, (size_t)pairs * 2);
-    }
-    (*env)->ReleaseByteArrayElements(env, out, buf, 0);
-    return (jint)(got / 2);
-}
-
-/*
- * Fill a long[4] with {total_reads, total_writes, writes_dropped, ring_occupancy}.
- */
-JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1stats(JNIEnv* env, jclass cls, //
-                                                                              jlong handle, jlongArray out)
-{
-    UNUSED(cls);
-    if (handle == 0 || out == NULL) return;
-    jni_i2c_bridge_t* b = (jni_i2c_bridge_t*)(size_t)handle;
-    if ((*env)->GetArrayLength(env, out) < 4) return;
-
-    jlong stats[4];
-    scoped_spin_lock (&b->lock) {
-        stats[0] = (jlong)b->total_reads;
-        stats[1] = (jlong)b->total_writes;
-        stats[2] = (jlong)b->writes_dropped;
-        stats[3] = (jlong)ringbuf_avail(&b->writes);
-    }
-    (*env)->SetLongArrayRegion(env, out, 0, 4, stats);
+    if (handle == 0) return 0;
+    jni_i2c_dev_bridge_t* b = (jni_i2c_dev_bridge_t*)(size_t)handle;
+    return (jint)b->assigned_addr;
 }
 
 /*

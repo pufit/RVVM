@@ -295,46 +295,45 @@ public class RVVMNative {
     public static native void can_node_bridge_stats(long handle, long[] out);
 
     //
-    // I2C sensor JNI bridge — read-shadow register file
+    // I2C device JNI bridge — synchronous Java callbacks
     //
-    // Attaches a 256-byte shadow-register I2C slave the guest can read like
-    // any sensor / EEPROM / IO expander. Java updates the shadow at any time
-    // via set/setBulk; the next guest read at that register address sees
-    // the new value. Guest writes are captured into a (register, value)
-    // event ring the JVM drains via pollWrites on tick.
+    // Attach a Java-driven slave to the machine's I2C bus. The handler
+    // implements the I2CDevice interface (start / write / read / stop);
+    // each guest transaction step crosses JNI exactly once and lands in
+    // the handler synchronously on the CPU thread that runs the i2c-oc
+    // dispatch.
     //
-    // No C→Java upcalls — read latency is one memcpy from the shadow.
+    // The shadow-register shape lives in Java now (ShadowRegisterI2CDevice)
+    // — the C-side bridge has no opinion about device semantics. Custom
+    // devices override the callbacks; sensor-shaped devices subclass the
+    // shadow helper and update its register file on tick.
+    //
     // Requires the machine to have an I2C bus already attached
-    // (i2c_bus_init_auto).
+    // (i2c_bus_init_auto). Handler must be non-null and must implement
+    // I2CDevice — the native side resolves start(Z)Z, write(B)Z, read()I,
+    // stop()V via reflection at attach time and fails fast if any are
+    // missing.
     //
 
-    // addr=0 picks an automatic address. Returns bridge handle, or 0 on failure.
-    public static native long i2c_sensor_bridge_init(long machine, int addr);
+    // addr=0 picks an automatic address (next free slot from 0x08).
+    // handler is the I2CDevice implementation. Returns bridge handle,
+    // or 0 on failure (no bus / null handler / missing methods / address
+    // collision).
+    public static native long i2c_dev_bridge_init(long machine, int addr, Object handler);
 
-    // Update one shadow register; reg masked to 0..255.
-    public static native void i2c_sensor_bridge_set(long handle, int reg, int value);
+    // Hot-detach the slave from the bus. Asks the bus to vector-erase
+    // the slot — fires the slave's remove hook (DeleteGlobalRef on the
+    // handler + frees the handle's native memory). i2c-oc serialises
+    // detach against in-flight callbacks via the bus lock, so a transfer
+    // mid-upcall completes before the bridge is torn down.
+    //
+    // After this call the handle is invalid; do not pass it to any
+    // other i2c_dev_bridge_* call. Idempotent on handle == 0.
+    public static native void i2c_dev_bridge_detach(long handle);
 
-    // Bulk shadow update: copy data into shadow[off..off+data.length), wrapping at 256.
-    public static native int  i2c_sensor_bridge_set_bulk(long handle, int off, byte[] data);
-
-    // Drain queued (addr, value) write events; out length must be even.
-    // Returns number of (addr, value) PAIRS drained (not bytes).
-    public static native int  i2c_sensor_bridge_poll_writes(long handle, byte[] out);
-
-    // Fills long[4] with {total_reads, total_writes, writes_dropped, ring_occupancy}.
-    public static native void i2c_sensor_bridge_stats(long handle, long[] out);
-
-    // Hot-detach the slave from the bus. Soft-NACKs in-flight transactions,
-    // then asks the bus to vector-erase the slot — fires the slave's remove
-    // hook (frees the handle's native memory). After this call the handle
-    // is invalid; do not pass it to any other i2c_sensor_bridge_* call.
-    // Idempotent on handle == 0.
-    public static native void i2c_sensor_bridge_detach(long handle);
-
-    // Returns the I2C address i2c_attach_dev assigned at init time (useful
-    // when init was called with addr=0 and the JVM needs the actual bus
-    // address, e.g. to drive a sysfs `new_device` binding).
-    public static native int  i2c_sensor_bridge_addr(long handle);
+    // Returns the I2C address i2c_attach_dev assigned at init time
+    // (useful when init was called with addr=0).
+    public static native int  i2c_dev_bridge_addr(long handle);
 
     //
     // USB device bridge
