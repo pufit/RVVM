@@ -379,4 +379,36 @@ public class RVVMNative {
     // Fill a long[6] with {in_fed, in_consumed, out_pushed, out_popped,
     // in_dropped, out_dropped}.
     public static native void usb_dev_stats(long handle, long[] out);
+
+    //
+    // SPI buffer JNI bridge — memory-buffer slave with cursor reset on CS
+    //
+    // Attaches a SPI slave behind a fresh SiFive SPI controller. Java
+    // provides a read buffer (variable size, set at attach time and
+    // replaceable via setBuffer); guest CS assertions reset a cursor to 0
+    // and subsequent transfers shift bytes out of the buffer at cursor++,
+    // wrapping at buffer end. Bytes the guest shifts in on MOSI are
+    // captured into a 4 KiB write ring the JVM drains via poll on tick.
+    //
+    // For pure write-sink slaves (display blasting, no MISO response
+    // expected), set the buffer to a single 0xFF byte and ignore poll's
+    // MISO data — transfers will return 0xFF on every byte and the slave
+    // looks like an open MISO line.
+    //
+
+    // bufBytes sets initial read-buffer size in bytes (clamped to ≥ 1).
+    // Returns bridge handle, or 0 on failure.
+    public static native long spi_buffer_bridge_init(long machine, int bufBytes);
+
+    // Replace the read buffer wholesale; cursor reset to 0.
+    public static native void spi_buffer_bridge_set_buffer(long handle, byte[] data);
+
+    // Update one byte in-place; out-of-range offsets are no-ops; cursor untouched.
+    public static native void spi_buffer_bridge_set_byte(long handle, int off, int value);
+
+    // Drain queued MOSI bytes the guest shifted into the slave.
+    public static native int  spi_buffer_bridge_poll(long handle, byte[] out);
+
+    // Fills long[4] with {total_transfers, writes_dropped, ring_occupancy, cursor}.
+    public static native void spi_buffer_bridge_stats(long handle, long[] out);
 }

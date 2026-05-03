@@ -1762,4 +1762,224 @@ JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_i2c_1sensor_1bridge_1stats(JN
     (*env)->SetLongArrayRegion(env, out, 0, 4, stats);
 }
 
+/*
+ * SPI buffer JNI bridge — memory-buffer slave with cursor reset on CS
+ *
+ * Attaches a SPI slave behind a fresh SiFive SPI controller. Java
+ * provides a read buffer (variable size, set at attach time); guest CS
+ * assertions reset a cursor to 0 and subsequent transfers shift bytes
+ * out of the buffer at cursor++ (wrapping at buffer end). Bytes the
+ * guest shifts in on MOSI are captured into a write ring the JVM drains
+ * via poll on tick.
+ *
+ * The cursor-reset-on-select shape matches "data product" slaves (a
+ * sensor that exposes its latest sample, an EEPROM that streams from
+ * offset 0 on each transaction, a status register the guest polls
+ * repeatedly). For streaming use cases that want monotonic cursors
+ * across CS assertions, a future setStreamMode() can disable the
+ * reset; not needed for the in-game-world case driving this bridge.
+ *
+ * For pure write-sink slaves (e.g. a guest blasting display bytes to
+ * /dev/spidevN.0 with no expected response), set the read buffer to a
+ * single 0xFF byte and ignore poll's MISO data — transfers will return
+ * 0xFF on every byte and the slave behaves as an open MISO line.
+ *
+ * Threading: select/transfer fire on the SPI controller's MMIO write
+ * thread (CPU thread). Buffer + ring access spinlock-guarded; Java
+ * setBuffer/setByte/poll lock the same spinlock. No JNI upcalls.
+ */
+
+#define JNI_SPI_RING_BYTES 4096
+
+typedef struct {
+    spinlock_t lock;
+    uint8_t*   read_buf;        // Java-managed MISO data
+    size_t     read_buf_size;
+    size_t     cursor;          // index into read_buf for the next transfer
+    ringbuf_t  writes;          // bytes guest shifted in on MOSI
+
+    uint64_t   total_transfers;
+    uint64_t   total_writes_dropped;
+} jni_spi_bridge_t;
+
+static void jni_spi_select(void* dev, bool asserted)
+{
+    jni_spi_bridge_t* b = dev;
+    if (!asserted) return;
+    scoped_spin_lock (&b->lock) {
+        b->cursor = 0;
+    }
+}
+
+static uint8_t jni_spi_transfer(void* dev, uint8_t tx)
+{
+    jni_spi_bridge_t* b = dev;
+    uint8_t           out = 0xFF;
+    scoped_spin_lock (&b->lock) {
+        if (b->read_buf_size > 0) {
+            out = b->read_buf[b->cursor];
+            b->cursor++;
+            if (b->cursor >= b->read_buf_size) b->cursor = 0;
+        }
+        if (ringbuf_space(&b->writes) < 1) {
+            uint8_t junk;
+            ringbuf_read(&b->writes, &junk, 1);
+            b->total_writes_dropped += 1;
+        }
+        ringbuf_write(&b->writes, &tx, 1);
+        b->total_transfers += 1;
+    }
+    return out;
+}
+
+static void jni_spi_remove(void* dev)
+{
+    jni_spi_bridge_t* b = dev;
+    free(b->read_buf);
+    ringbuf_destroy(&b->writes);
+    free(b);
+}
+
+/*
+ * Wire a fresh SPI slave on `machine`. Internally creates a SiFive SPI
+ * controller, attaches the slave at SPI_AUTO_CS (= cs0 on a fresh
+ * controller). `bufBytes` sets the initial read-buffer size in bytes
+ * (rounded up to 1 if zero); use setBuffer to populate / replace it.
+ */
+JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1init(JNIEnv* env, jclass cls, //
+                                                                              jlong machine, jint bufBytes)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    rvvm_machine_t*  m        = (rvvm_machine_t*)(size_t)machine;
+    rvvm_mmio_dev_t* spi_mmio = spi_sifive_init_auto(m);
+    if (spi_mmio == NULL) {
+        rvvm_error("SPI buffer bridge: spi_sifive_init_auto failed");
+        return 0;
+    }
+
+    if (bufBytes <= 0) bufBytes = 1;
+    jni_spi_bridge_t* b = safe_new_obj(jni_spi_bridge_t);
+    b->read_buf      = safe_new_arr(uint8_t, (size_t)bufBytes);
+    b->read_buf_size = (size_t)bufBytes;
+    memset(b->read_buf, 0xFF, b->read_buf_size); // unconfigured slave returns 0xFF
+    ringbuf_create(&b->writes, JNI_SPI_RING_BYTES);
+
+    spi_dev_t desc = {
+        .cs_id    = SPI_AUTO_CS,
+        .data     = b,
+        .select   = jni_spi_select,
+        .transfer = jni_spi_transfer,
+        .remove   = jni_spi_remove,
+    };
+    if (spi_attach_dev(spi_sifive_get_bus(spi_mmio), &desc) == SPI_AUTO_CS) {
+        rvvm_error("SPI buffer bridge: spi_attach_dev failed");
+        free(b->read_buf);
+        ringbuf_destroy(&b->writes);
+        free(b);
+        return 0;
+    }
+    return (jlong)(size_t)b;
+}
+
+/*
+ * Replace the read buffer wholesale. The new buffer is copied into a
+ * C allocation; the old buffer is freed. Cursor is reset to 0. Pass a
+ * zero-length array to leave the buffer empty (transfers will return
+ * 0xFF unconditionally).
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1set_1buffer(JNIEnv* env, jclass cls, //
+                                                                                     jlong handle, jbyteArray data)
+{
+    UNUSED(cls);
+    if (handle == 0 || data == NULL) return;
+    jni_spi_bridge_t* b   = (jni_spi_bridge_t*)(size_t)handle;
+    jsize             len = (*env)->GetArrayLength(env, data);
+
+    uint8_t* new_buf = NULL;
+    if (len > 0) {
+        new_buf = safe_new_arr(uint8_t, (size_t)len);
+        jbyte* src = (*env)->GetByteArrayElements(env, data, NULL);
+        if (src == NULL) {
+            free(new_buf);
+            return;
+        }
+        memcpy(new_buf, src, (size_t)len);
+        (*env)->ReleaseByteArrayElements(env, data, src, JNI_ABORT);
+    }
+
+    uint8_t* old_buf;
+    scoped_spin_lock (&b->lock) {
+        old_buf          = b->read_buf;
+        b->read_buf      = new_buf;
+        b->read_buf_size = (size_t)len;
+        b->cursor        = 0;
+    }
+    free(old_buf);
+}
+
+/*
+ * Update one byte of the read buffer. Out-of-range offsets are silent
+ * no-ops. Cursor is not touched.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1set_1byte(JNIEnv* env, jclass cls, //
+                                                                                   jlong handle, jint off, jint value)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (handle == 0) return;
+    jni_spi_bridge_t* b = (jni_spi_bridge_t*)(size_t)handle;
+    scoped_spin_lock (&b->lock) {
+        if (off >= 0 && (size_t)off < b->read_buf_size) {
+            b->read_buf[off] = (uint8_t)(value & 0xFF);
+        }
+    }
+}
+
+/*
+ * Drain queued MOSI bytes the guest shifted into the slave. Returns the
+ * count actually drained.
+ */
+JNIEXPORT jint JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1poll(JNIEnv* env, jclass cls, //
+                                                                              jlong handle, jbyteArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return 0;
+    jni_spi_bridge_t* b   = (jni_spi_bridge_t*)(size_t)handle;
+    jsize             cap = (*env)->GetArrayLength(env, out);
+    if (cap <= 0) return 0;
+
+    jbyte* buf = (*env)->GetByteArrayElements(env, out, NULL);
+    if (buf == NULL) return 0;
+
+    size_t got = 0;
+    scoped_spin_lock (&b->lock) {
+        got = ringbuf_read(&b->writes, buf, (size_t)cap);
+    }
+    (*env)->ReleaseByteArrayElements(env, out, buf, 0);
+    return (jint)got;
+}
+
+/*
+ * Fill a long[4] with {total_transfers, writes_dropped, ring_occupancy,
+ * cursor}.
+ */
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_spi_1buffer_1bridge_1stats(JNIEnv* env, jclass cls, //
+                                                                              jlong handle, jlongArray out)
+{
+    UNUSED(cls);
+    if (handle == 0 || out == NULL) return;
+    jni_spi_bridge_t* b = (jni_spi_bridge_t*)(size_t)handle;
+    if ((*env)->GetArrayLength(env, out) < 4) return;
+
+    jlong stats[4];
+    scoped_spin_lock (&b->lock) {
+        stats[0] = (jlong)b->total_transfers;
+        stats[1] = (jlong)b->total_writes_dropped;
+        stats[2] = (jlong)ringbuf_avail(&b->writes);
+        stats[3] = (jlong)b->cursor;
+    }
+    (*env)->SetLongArrayRegion(env, out, 0, 4, stats);
+}
+
 POP_OPTIMIZATION_SIZE
