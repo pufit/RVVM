@@ -394,6 +394,37 @@ JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_tap_1user_1open(JNIEnv* env,
     return (size_t)tap_open();
 }
 
+JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_tap_1portfwd(JNIEnv* env, jclass cls, //
+                                                                    jlong tap, jstring fwd)
+{
+    UNUSED(cls);
+    if (tap == 0 || fwd == NULL) return JNI_FALSE;
+    const char* u8_fwd = (*env)->GetStringUTFChars(env, fwd, NULL);
+    bool ok = tap_portfwd((tap_dev_t*)(size_t)tap, u8_fwd);
+    (*env)->ReleaseStringUTFChars(env, fwd, u8_fwd);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_tap_1ifaddr(JNIEnv* env, jclass cls, //
+                                                                   jlong tap, jstring addr)
+{
+    UNUSED(cls);
+    if (tap == 0 || addr == NULL) return JNI_FALSE;
+    const char* u8_addr = (*env)->GetStringUTFChars(env, addr, NULL);
+    bool ok = tap_ifaddr((tap_dev_t*)(size_t)tap, u8_addr);
+    (*env)->ReleaseStringUTFChars(env, addr, u8_addr);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_tap_1close(JNIEnv* env, jclass cls, //
+                                                              jlong tap)
+{
+    UNUSED(env);
+    UNUSED(cls);
+    if (tap == 0) return;
+    tap_close((tap_dev_t*)(size_t)tap);
+}
+
 JNIEXPORT jlong JNICALL Java_lekkit_rvvm_RVVMNative_syscon_1init_1auto(JNIEnv* env, jclass cls, //
                                                                        jlong machine)
 {

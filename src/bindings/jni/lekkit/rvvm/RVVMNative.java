@@ -115,6 +115,17 @@ public class RVVMNative {
     // Returns TAP device handle
     public static native long tap_user_open();
 
+    // Forward a host port into the guest network.
+    // Format mirrors tap_api.h: "tcp/2022=22", "[::1]:2022=22",
+    // "127.0.0.1:2022=192.168.0.101:22". Returns true on success.
+    public static native boolean tap_portfwd(long tap, String fwd);
+
+    // Set the host-side interface address for this TAP.
+    public static native boolean tap_ifaddr(long tap, String addr);
+
+    // Shut down a TAP interface, releasing any forwarded host ports.
+    public static native void tap_close(long tap);
+
     // Returns MMIO handle
     public static native long syscon_init_auto(long machine);
     public static native long rtc_goldfish_init_auto(long machine);
