@@ -120,9 +120,6 @@ public class RVVMNative {
     // "127.0.0.1:2022=192.168.0.101:22". Returns true on success.
     public static native boolean tap_portfwd(long tap, String fwd);
 
-    // Set the host-side interface address for this TAP.
-    public static native boolean tap_ifaddr(long tap, String addr);
-
     // Shut down a TAP interface, releasing any forwarded host ports.
     public static native void tap_close(long tap);
 

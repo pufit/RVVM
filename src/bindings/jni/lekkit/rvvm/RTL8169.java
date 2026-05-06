@@ -48,13 +48,4 @@ public class RTL8169 extends PCIDevice {
         return RVVMNative.tap_portfwd(tap, fwd);
     }
 
-    /**
-     * Override the host interface address that gets bound for
-     * forwarded ports. Default is all interfaces. Pass e.g.
-     * {@code "127.0.0.1"} to keep the forwarded ports loopback-only.
-     */
-    public boolean ifaddr(String addr) {
-        if (tap == 0 || addr == null) return false;
-        return RVVMNative.tap_ifaddr(tap, addr);
-    }
 }

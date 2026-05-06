@@ -405,17 +405,6 @@ JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_tap_1portfwd(JNIEnv* env,
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
-JNIEXPORT jboolean JNICALL Java_lekkit_rvvm_RVVMNative_tap_1ifaddr(JNIEnv* env, jclass cls, //
-                                                                   jlong tap, jstring addr)
-{
-    UNUSED(cls);
-    if (tap == 0 || addr == NULL) return JNI_FALSE;
-    const char* u8_addr = (*env)->GetStringUTFChars(env, addr, NULL);
-    bool ok = tap_ifaddr((tap_dev_t*)(size_t)tap, u8_addr);
-    (*env)->ReleaseStringUTFChars(env, addr, u8_addr);
-    return ok ? JNI_TRUE : JNI_FALSE;
-}
-
 JNIEXPORT void JNICALL Java_lekkit_rvvm_RVVMNative_tap_1close(JNIEnv* env, jclass cls, //
                                                               jlong tap)
 {
