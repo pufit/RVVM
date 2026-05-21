@@ -183,7 +183,7 @@ static inline bool riscv_csr_seed(rvvm_hart_t* vm, rvvm_uxlen_t* dest)
         // returns false — effectively making Zkr a no-op at best and a
         // 100x-slower no-op at worst. Wire in the success marker.
         rvvm_csprng_bytes(&seed, sizeof(seed));
-        return riscv_csr_const(dest, 0x80000000ULL | seed);
+        return riscv_csr_const(dest, CSR_SEED_OPST_ES16 | seed);
     }
     return false;
 }
