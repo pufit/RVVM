@@ -166,6 +166,12 @@ override LIBS_USE_X11     := x11 xext
 override LIBS_USE_WAYLAND := wayland-client xkbcommon
 
 #
+# Additional headers
+#
+
+override CFLAGS := $(CFLAGS) -I$(SRCDIR)/util
+
+#
 # Prepare build targets
 #
 
