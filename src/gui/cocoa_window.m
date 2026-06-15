@@ -257,12 +257,12 @@ static hid_key_t cocoa_key_to_hid(uint16_t key)
                                    kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little, //
                                    prov, NULL, false, kCGRenderingIntentDefault);
     if (img) {
-        // Flip into a top-left origin so the top scanout row maps to the window top
-        CGContextSaveGState(ctx);
-        CGContextTranslateCTM(ctx, 0.0, vh);
-        CGContextScaleCTM(ctx, 1.0, -1.0);
-        CGContextDrawImage(ctx, CGRectMake(m_pos_x, m_pos_y, m_width, m_height), img);
-        CGContextRestoreGState(ctx);
+        // The view is non-flipped, so CoreGraphics user space is bottom-left
+        // origin and CGContextDrawImage already maps the scanout's first (top)
+        // row to the top of the dest rect - no CTM flip needed. Translate the
+        // top-left letterbox offset into the bottom-left rect origin CG wants.
+        CGFloat rect_y = vh - (CGFloat)m_pos_y - (CGFloat)m_height;
+        CGContextDrawImage(ctx, CGRectMake(m_pos_x, rect_y, m_width, m_height), img);
         CGImageRelease(img);
     }
     CGDataProviderRelease(prov);
