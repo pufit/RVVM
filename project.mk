@@ -132,7 +132,7 @@ endif
 # Useflag conditional sources
 override SRC_USE_WIN32_GUI := $(SRCDIR)/gui/win32_window.c
 override SRC_USE_HAIKU_GUI := $(SRCDIR)/gui/haiku_window.cpp
-override SRC_USE_COCOA_GUI := $(SRCDIR)/gui/cocoa_window.m
+override SRC_USE_COCOA_GUI := $(SRCDIR)/gui/cocoa_window.c
 override SRC_USE_X11       := $(SRCDIR)/gui/x11_window.c
 override SRC_USE_SDL       := $(SRCDIR)/gui/sdl_window.c
 override SRC_USE_WAYLAND   := $(SRCDIR)/gui/wayland_window.c
@@ -174,7 +174,7 @@ override LIB_TARGETS := rvvm # TODO: rvvm_libretro FTBFS
 
 override bin_src_rvvm          := $(SRCDIR)/main.c
 override lib_src_rvvm_libretro := $(SRCDIR)/bindings/libretro/libretro.c
-override lib_src_rvvm          := $(filter-out $(bin_src_rvvm) $(lib_src_rvvm_libretro),$(call recursive_match,$(SRCDIR),*.c *.cpp *.cc *.cxx *.m))
+override lib_src_rvvm          := $(filter-out $(bin_src_rvvm) $(lib_src_rvvm_libretro),$(call recursive_match,$(SRCDIR),*.c *.cpp *.cc *.cxx))
 
 override bin_libs_rvvm := rvvm
 override lib_libs_rvvm := $(if $(call var_use,USE_LIBS_PROBE),,$(LIBS_USE_SDL) $(LIBS_USE_X11) $(LIBS_USE_WAYLAND))
