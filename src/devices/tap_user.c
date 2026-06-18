@@ -859,6 +859,13 @@ static void handle_arp(tap_dev_t* tap, const uint8_t* buffer, size_t size)
         return;
     }
 
+    // Never answer ARP for the client's own address. Catches DAD probes
+    // that set sender_ip to the offered address and slip past the check
+    // above; nothing but the client lives behind CLIENT_IP.
+    if (!memcmp(target_ip, CLIENT_IP, PLEN_IPv4)) {
+        return;
+    }
+
     // Reply with ourselves as the owner of target_ip. User-mode
     // networking proxies all off-LAN traffic through GATEWAY_MAC, so
     // answering broadly here is correct once we've filtered out the
