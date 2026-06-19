@@ -36,6 +36,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <devices/framebuffer.h>
 #include <devices/i2c-oc.h>
 #include <devices/ns16550a.h>
+#include <devices/unibus-devices.h>
 #include <devices/nvme.h>
 #include <devices/pci-bus.h>
 #include <devices/pci-vfio.h>
@@ -346,6 +347,13 @@ static int rvvm_cli_main(int argc, char** argv)
 
     pci_bus_init_auto(machine);
     i2c_oc_init_auto(machine);
+
+    if (rvvm_has_arg("pdp11")) {
+        // Attach the PDP-11 Unibus device set (KW11-L clock, KL11 console,
+        // RF11 drum) for the hand-ported 1st Edition UNIX kernel. See
+        // docs/unibus.md.
+        unibus_pdp11_init_auto(machine);
+    }
 
     // usb_xhci_init(rvvm_get_pci_bus(machine));
 

@@ -38,3 +38,6 @@
 !/.mailmap
 !/.gitignore
 !/.clang-format
+
+# macOS
+.DS_Store
