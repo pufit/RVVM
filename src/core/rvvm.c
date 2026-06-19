@@ -845,6 +845,21 @@ PUBLIC bool rvvm_read_ram(rvvm_machine_t* machine, void* dest, rvvm_addr_t src, 
     return false;
 }
 
+// Debug introspection: read a hart's integer registers. out[0..31] = x0..x31,
+// out[32] = PC. Best read while the machine is paused (a running JIT hart only
+// syncs PC/registers at block boundaries). Returns false on a bad hart index.
+PUBLIC bool rvvm_dbg_read_regs(rvvm_machine_t* machine, size_t hart_idx, uint64_t* out)
+{
+    if (!machine || !out || hart_idx >= vector_size(machine->harts)) {
+        return false;
+    }
+    rvvm_hart_t* hart = vector_at(machine->harts, hart_idx);
+    for (size_t i = 0; i < RISCV_REGS_MAX; i++) {
+        out[i] = hart->registers[i];
+    }
+    return true;
+}
+
 PUBLIC void* rvvm_get_dma_ptr(rvvm_machine_t* machine, rvvm_addr_t addr, size_t size)
 {
     if (likely(machine && addr >= machine->mem.addr && addr + size <= machine->mem.addr + machine->mem.size)) {
