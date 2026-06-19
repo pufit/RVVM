@@ -88,6 +88,11 @@ typedef struct {
     uint32_t cma; // current memory address (bus address)
     uint32_t dar; // disk address (low)
     uint32_t dae; // disk address extension (high)
+
+    // Debug counters (boot diagnostics)
+    uint64_t xfers;      // total transfers performed
+    uint32_t last_block; // last block transferred
+    uint32_t last_func;  // last function (read/write)
 } rf11_dev_t;
 
 // Re-evaluate the completion interrupt from dcs (Done & IE)
@@ -112,12 +117,15 @@ static void rf11_go(rf11_dev_t* rf)
     size_t   words    = (uint16_t)(-(int16_t)(uint16_t)wc);
     size_t   bytes    = words * 2;
 
-    // Disk address: dar low | dae high give the starting block number; the
-    // driver loads the physical block number split across dar/dae (u8.s).
+    // Disk address: the RF11 is addressed by WORD, not block. dar holds the
+    // low 16 bits and dae the high bits of the word address. The V1 driver
+    // (u8.s "prf:") encodes block N as dar = (N&0xff)<<8, dae = N>>8, i.e.
+    // (dae<<16)|dar == N*256 == the word address of the block. So the byte
+    // offset is the word address times two (a 512-byte block is 256 words).
     uint32_t dar      = atomic_load_uint32_relax(&rf->dar);
     uint32_t dae      = atomic_load_uint32_relax(&rf->dae);
-    uint64_t block    = ((uint64_t)dae << 16) | (uint16_t)dar;
-    uint64_t disk_off = block * RF11_BLOCK_BYTES;
+    uint64_t word_addr = ((uint64_t)dae << 16) | (uint16_t)dar;
+    uint64_t disk_off  = word_addr * 2;
 
     // Memory (Unibus) address the data is transferred to/from.
     rvvm_addr_t mem_addr = atomic_load_uint32_relax(&rf->cma);
@@ -137,6 +145,10 @@ static void rf11_go(rf11_dev_t* rf)
     // set Error if the transfer was out of bounds or had a bad function.
     atomic_store_uint32_relax(&rf->cma, (uint16_t)(mem_addr + bytes));
     atomic_store_uint32_relax(&rf->wc, 0);
+
+    rf->xfers++;
+    rf->last_block = (uint32_t)(disk_off / RF11_BLOCK_BYTES);
+    rf->last_func  = func;
 
     uint32_t new_dcs = (dcs & ~(RF11_DCS_GO | RF11_DCS_ERR)) | RF11_DCS_READY;
     if (!ok) {
@@ -202,17 +214,29 @@ static void rf11_write(unibus_dev_t* dev, uint16_t val, size_t off)
     }
 }
 
-static void rf11_poll(unibus_dev_t* dev)
-{
-    // Re-assert a level-triggered completion IRQ if the guest re-enabled IE
-    // without clearing Done. (No periodic work is otherwise needed.)
-    rf11_update_irq(unibus_dev_data(dev));
-}
+// No periodic work: the completion interrupt is a one-shot raised by rf11_go
+// when a transfer finishes and cleared when the bus grants its vector (IAK).
+// We must NOT re-assert it from the poll -- the RF11 leaves Done/IE set after a
+// transfer and the V1 driver clears them only by issuing the next command, so
+// re-raising here produces a spurious-interrupt storm between transfers.
 
 static void rf11_cleanup(unibus_dev_t* dev)
 {
     rf11_dev_t* rf = unibus_dev_data(dev);
     free(rf->store);
+}
+
+// Boot diagnostics: total transfers and the last block/function touched.
+RVVM_PUBLIC void rvvm_rf11_stats(unibus_dev_t* dev, uint64_t* xfers,
+                                 uint32_t* last_block, uint32_t* last_func)
+{
+    if (!dev) {
+        return;
+    }
+    rf11_dev_t* rf = unibus_dev_data(dev);
+    if (xfers)      *xfers      = rf->xfers;
+    if (last_block) *last_block = rf->last_block;
+    if (last_func)  *last_func  = rf->last_func;
 }
 
 // Load an initial drum image (root + swap) into the backing store. Bytes past
@@ -250,7 +274,6 @@ RVVM_PUBLIC unibus_dev_t* rvvm_rf11_init(unibus_t* bus, size_t image_size_blocks
         .size     = 0xA,    // dcs(0)..dae(8), 5 word registers
         .read     = rf11_read,
         .write    = rf11_write,
-        .poll     = rf11_poll,
         .cleanup  = rf11_cleanup,
         .min_size = 2,
         .br_level = RF11_BR,
