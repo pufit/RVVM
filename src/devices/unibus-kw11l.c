@@ -123,7 +123,8 @@ RVVM_PUBLIC unibus_dev_t* rvvm_kw11l_init(unibus_t* bus, uint64_t line_hz)
         .poll     = kw11l_poll,
         .min_size = 2,
         .br_level = UNIBUS_BR7, // processor level 7 (u0.s: clock;340)
-        .vector   = 0064,       // kernel's clock vector (u0.s . = orig+60)
+        .vector   = 0100,       // clock is the 5th vector from orig+60 -> 0100
+                                // octal (0064 is ttyo, used by the KL11 TX)
         .data     = clk,
     };
 
