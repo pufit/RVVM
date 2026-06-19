@@ -52,6 +52,8 @@ dcs bit layout (RF11):
 #include "unibus.h"
 #include "utils.h"
 
+#include <string.h> // memcpy (drum image load)
+
 PUSH_OPTIMIZATION_SIZE
 
 #define RF11_DCS_GO    0x0001 // bit 0: start transfer
@@ -211,6 +213,21 @@ static void rf11_cleanup(unibus_dev_t* dev)
 {
     rf11_dev_t* rf = unibus_dev_data(dev);
     free(rf->store);
+}
+
+// Load an initial drum image (root + swap) into the backing store. Bytes past
+// the store are dropped; a short image leaves the tail (the swap area) zeroed.
+RVVM_PUBLIC bool rvvm_rf11_load(unibus_dev_t* dev, const void* data, size_t len)
+{
+    if (!dev || !data) {
+        return false;
+    }
+    rf11_dev_t* rf = unibus_dev_data(dev);
+    if (len > rf->size) {
+        len = rf->size;
+    }
+    memcpy(rf->store, data, len);
+    return true;
 }
 
 RVVM_PUBLIC unibus_dev_t* rvvm_rf11_init(unibus_t* bus, size_t image_size_blocks)
