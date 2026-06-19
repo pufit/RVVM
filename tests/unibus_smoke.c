@@ -162,9 +162,11 @@ int main(void)
     // IAK at P=7: BR7 is not strictly greater than 7, so nothing is granted.
     check("IAK P>=7 grants nothing", unibus_ack(bus, 7) == 0);
 
-    // IAK at P=0: the clock (BR7) outranks P, grant returns vector 064.
+    // IAK at P=0: the clock (BR7) outranks P, grant returns vector 0100
+    // (1st Edition UNIX's u0.s vector table puts the clock at 0100; see
+    // unibus-kw11l.c).
     uint16_t vec = unibus_ack(bus, 0);
-    check("IAK P=0 grants clock vector 064", vec == 0064);
+    check("IAK P=0 grants clock vector 0100", vec == 0100);
 
     // The grant cleared the request, so a second IAK grants nothing and the
     // bus drops the RISC-V line.

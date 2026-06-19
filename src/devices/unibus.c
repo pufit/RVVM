@@ -62,25 +62,41 @@ struct rvvm_unibus {
     // returns it. See the contract in unibus.h.
     uint32_t iak_grant;
 
+    // Processor status word (PSW). The kernel writes this (window 0177776) to
+    // set the processor priority; bits 5:7 gate which BR levels may interrupt.
+    // Resets to 0; the firmware boot establishes the power-up priority by
+    // writing the PSW before it unmasks interrupts. See UNIBUS_PSW in unibus.h.
+    uint32_t psw;
+
     vector_t(unibus_dev_t*) dev;
     spinlock_t lock;
 };
 
+// Current processor priority (PSW bits 5:7, range 0..7)
+static uint32_t unibus_cur_prio(unibus_t* bus)
+{
+    return (atomic_load_uint32_relax(&bus->psw) >> 5) & 0x7;
+}
+
 /*
- * Re-evaluate the shared RISC-V external line: assert it while any device
- * is asserting a BR line, deassert it when none are.
+ * Re-evaluate the shared RISC-V external line: assert it while any pending
+ * device outranks the current processor priority, deassert it otherwise.
  *
  * The real Unibus has four separate BRx lines arbitrated in hardware; the
- * RISC-V hart has one external line, so we OR all pending BR requests onto
- * it. Per-level arbitration is resolved later, in the IAK read.
+ * RISC-V hart has one external line, so we OR all pending BR requests that are
+ * above the PSW priority onto it. Per-level arbitration among those is
+ * resolved later, in the IAK read. Gating on the PSW priority here is what
+ * makes the processor defer a BRx request below P (Handbook p.268) instead of
+ * taking it the instant RISC-V MIE allows -- the spl the kernel relies on.
  */
 static void unibus_update_irq_line(unibus_t* bus)
 {
-    bool pending = false;
+    bool     pending = false;
+    uint32_t prio    = unibus_cur_prio(bus);
     scoped_spin_lock (&bus->lock) {
         vector_foreach (bus->dev, i) {
             unibus_dev_t* dev = vector_at(bus->dev, i);
-            if (dev && atomic_load_uint32_relax(&dev->irq_pending)) {
+            if (dev && atomic_load_uint32_relax(&dev->irq_pending) && dev->br_level > prio) {
                 pending = true;
                 break;
             }
@@ -102,6 +118,13 @@ static void unibus_update_irq_line(unibus_t* bus)
 static uint16_t unibus_iak(unibus_t* bus, uint32_t prio)
 {
     unibus_dev_t* winner = NULL;
+    // Never grant below the live PSW priority, even if the dispatcher asks at a
+    // lower P: the interrupted code's spl still masks those levels. The
+    // dispatcher's P only ever raises the floor (nested servicing).
+    uint32_t psw_prio = unibus_cur_prio(bus);
+    if (psw_prio > prio) {
+        prio = psw_prio;
+    }
     scoped_spin_lock (&bus->lock) {
         vector_foreach (bus->dev, i) {
             unibus_dev_t* dev = vector_at(bus->dev, i);
@@ -154,6 +177,16 @@ static bool unibus_mmio_read(rvvm_mmio_dev_t* mmio, void* data, size_t offset, u
         write_uint16_le(data, 0);
         return true;
     }
+    if ((offset & ~(size_t)1) == UNIBUS_PSW) {
+        // Processor status word: the kernel reads back its priority here.
+        uint16_t psw = (uint16_t)atomic_load_uint32_relax(&bus->psw);
+        if (size == 1) {
+            write_uint8(data, (offset & 1) ? (psw >> 8) : (psw & 0xFF));
+        } else {
+            write_uint16_le(data, psw);
+        }
+        return true;
+    }
 
     unibus_dev_t* dev = NULL;
     scoped_spin_lock (&bus->lock) {
@@ -186,6 +219,21 @@ static bool unibus_mmio_write(rvvm_mmio_dev_t* mmio, void* data, size_t offset, 
         return true;
     }
     if (offset == UNIBUS_IAK_VEC) {
+        return true;
+    }
+    if ((offset & ~(size_t)1) == UNIBUS_PSW) {
+        // Writing the PSW sets the processor priority; re-evaluate which
+        // pending BR levels may now interrupt (an spl lower may release one).
+        uint16_t psw = (uint16_t)atomic_load_uint32_relax(&bus->psw);
+        if (size == 1) {
+            uint8_t b = read_uint8(data);
+            psw = (offset & 1) ? ((psw & 0x00FF) | ((uint16_t)b << 8))
+                               : ((psw & 0xFF00) | b);
+        } else {
+            psw = read_uint16_le(data);
+        }
+        atomic_store_uint32_relax(&bus->psw, psw);
+        unibus_update_irq_line(bus);
         return true;
     }
 
@@ -271,6 +319,8 @@ PUBLIC unibus_t* unibus_init(rvvm_machine_t* machine, rvvm_addr_t mem_base)
     unibus_t* bus = safe_new_obj(unibus_t);
     bus->machine  = machine;
     bus->mem_base = mem_base;
+    bus->psw      = 0; // neutral hardware reset; the firmware boot establishes
+                       // the power-up processor priority (it writes the PSW)
     bus->intc     = rvvm_get_intc(machine);
 
     if (!bus->intc) {

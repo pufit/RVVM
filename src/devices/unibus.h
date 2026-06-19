@@ -149,6 +149,24 @@ See docs/unibus.md for the full design notes and per-device register table.
 #define UNIBUS_IAK_PRI 0x1FF0 // W: current processor priority P (PSW 5:7)
 #define UNIBUS_IAK_VEC 0x1FF2 // R: granted vector (level > P), 0 if none
 
+/*
+ * Processor status word (PSW), window address 0177776 octal == 0xFFFE, i.e.
+ * I/O-page offset 0x1FFE. Unlike the IAK pair this IS a real PDP-11 register:
+ * the PDP-11/20 exposes the PSW at 777776 (Handbook Ch.8 p.216), and 1st
+ * Edition UNIX raises/lowers the processor priority by writing it directly
+ * ("mov $340,*$ps" / "clr *$ps", ps = 0177776).
+ *
+ * Modeling it on the bus closes the delivery gap in the IAK contract above:
+ * the bus asserts the single RISC-V external line only while a pending device
+ * outranks the current PSW priority (bits 5:7), so a device that completes
+ * while the kernel is at high priority (e.g. the RF11 finishing its DMA inside
+ * the GO store while ppoke holds level 7) is deferred until the kernel lowers
+ * priority -- exactly as the real processor defers BRx below P. Without this,
+ * the RISC-V interrupt would be taken the instant MIE allows it, reentering
+ * the very critical section the spl was meant to protect.
+ */
+#define UNIBUS_PSW 0x1FFE // R/W: processor status word (priority in bits 5:7)
+
 // Maximum register-block size of a single Unibus device
 #define UNIBUS_DEV_MAX_SIZE 0x40
 
