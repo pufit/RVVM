@@ -13,20 +13,36 @@ provides a realtime clock input for the system. It pulses with each cycle of
 the line current."). Each tick sets the Monitor (done) bit; if interrupt
 enable is set, it requests a Unibus interrupt.
 
-Addresses / vector (the binding contract is the ported kernel; the Handbook
-values are noted for reference):
+Addresses / vector / BR level (the binding contract is the ported kernel;
+the Handbook and Fourth Edition source are noted for cross-reference):
   - LKS  = 0177546 octal  (Handbook Appendix A p.A-1: "DL11-W(LTC) 777546
            ... line clock", and BDV11-LTC 777546).
-  - BR7 / processor level 7 -- the kernel's u0.s vector table
-    (build/u0.s: "clock;340  / clock interrupt vector ; processor level 7").
-  - Vector 064 octal -- per the kernel's u0.s (". = orig+60" block, the
-    fifth entry "clock;340" lands at offset 64). The Handbook's Appendix A
-    fixed assignment for KW11-L is vector 100 (p.A-5); 1st Edition UNIX uses
-    its own table, and that table is what we honor here.
+  - Vector 0100 octal -- the kernel's u0.s ". = orig+60" block holds five
+    two-word entries (ttyi 060, ttyo 064, ppti 070, ppto 074, clock 0100),
+    so the clock lands at 0100, NOT 064 (064 is ttyo, used by the KL11 TX).
+    This matches the Handbook's fixed KW11-L vector (p.A-5) and Fourth
+    Edition (low.s ". = 100^." / "kwlp").
+  - BR6 -- the KW11-L hardwires its bus request on BR6. This is a property
+    of the backplane wiring, not of the kernel, and the vector table does
+    NOT encode it. Fourth Edition states it outright (low.s: "kwlp; br6",
+    where br6 = 0300). DO NOT read it off the "340" in u0.s "clock;340":
+    that 340 is the *new PS* (second vector word) the dispatcher loads into
+    the PSW on taking the interrupt -- the priority the clock ISR *runs at*
+    (level 7), so the tick handler masks every device while it runs. It is
+    a software run-level, not the bus-request line: the very same KW11-L
+    runs its ISR at level 6 (PS 300) in Fourth Edition and level 7 (PS 340)
+    in First Edition. Modeling the request at BR7 would let the clock
+    preempt the kernel's spl6 critical sections (u3.s "swap", u4.s runq
+    manipulation), which on real hardware a BR6 clock cannot.
 
 LKS bit layout (KW11-L):
-  bit  7  Monitor / Done  -- set each line tick, cleared by writing 0
-  bit  6  Interrupt Enable
+  bit  7  Monitor / Done  -- set by hardware each line tick; cannot be set
+          under program control. Cleared by EITHER reading LKS (the First
+          Edition ISR restarts the clock with a bare "tst *$lks", u4.s) OR
+          by writing 0 to bit 7 (Fourth Edition acks with "*lks = 0115",
+          clock.c -- bit 7 clear, IE set). Clearing it drops the interrupt
+          request; both clear paths are honored here so either kernel works.
+  bit  6  Interrupt Enable (read/write)
 */
 
 #include <rvvm/rvvm_board.h>
@@ -81,17 +97,34 @@ static void kw11l_read(unibus_dev_t* dev, uint16_t* val, size_t off)
 {
     kw11l_dev_t* clk = unibus_dev_data(dev);
     UNUSED(off);
-    // Reading LKS reflects the current Monitor/IE bits.
-    *val = (uint16_t)atomic_load_uint32_relax(&clk->lks);
+    // Read returns the current Monitor/IE bits, then clears Monitor as a
+    // side effect (KW11-L read-to-restart). This is how the First Edition
+    // ISR dismisses the tick interrupt: a bare "tst *$lks" with no write
+    // (u4.s "clock:"). atomic_and returns the pre-clear value, so the guest
+    // still observes the Monitor bit that was set.
+    uint32_t old = atomic_and_uint32(&clk->lks, ~(uint32_t)KW11L_LKS_DONE);
+    *val = (uint16_t)old;
+    kw11l_update_irq(clk); // Monitor now clear -> drop the request
 }
 
 static void kw11l_write(unibus_dev_t* dev, uint16_t val, size_t off)
 {
     kw11l_dev_t* clk = unibus_dev_data(dev);
     UNUSED(off);
-    // Writing LKS sets Interrupt Enable and clears Monitor when the guest
-    // writes a 0 to bit 7 (the standard ack on the KW11-L).
-    atomic_store_uint32_relax(&clk->lks, val & KW11L_LKS_RW);
+    // Interrupt Enable follows the written bit 6. Monitor cannot be SET
+    // under program control (only the line tick sets it), and writing a 0
+    // to bit 7 CLEARS it -- the Fourth Edition ack "*lks = 0115" (IE set,
+    // bit 7 clear). A CAS keeps a concurrent tick (poll thread) from being
+    // lost between load and store.
+    uint32_t cur;
+    uint32_t next;
+    do {
+        cur  = atomic_load_uint32_relax(&clk->lks);
+        next = (uint32_t)(val & KW11L_LKS_IE); // IE from the write
+        if (val & KW11L_LKS_DONE) {
+            next |= (cur & KW11L_LKS_DONE);    // bit 7 not cleared: keep Monitor
+        }                                      // bit 7 == 0: Monitor cleared
+    } while (!atomic_cas_uint32(&clk->lks, cur, next));
     kw11l_update_irq(clk);
 }
 
@@ -122,7 +155,12 @@ RVVM_PUBLIC unibus_dev_t* rvvm_kw11l_init(unibus_t* bus, uint64_t line_hz)
         .write    = kw11l_write,
         .poll     = kw11l_poll,
         .min_size = 2,
-        .br_level = UNIBUS_BR7, // processor level 7 (u0.s: clock;340)
+        .br_level = UNIBUS_BR6, // KW11-L requests on BR6 (Fourth Edition
+                                // low.s "kwlp; br6"). The 340 in u0.s
+                                // "clock;340" is the ISR's new PS / run
+                                // level 7, NOT the bus-request line; see the
+                                // file header. BR7 here would defeat the
+                                // kernel's spl6 critical sections.
         .vector   = 0100,       // clock is the 5th vector from orig+60 -> 0100
                                 // octal (0064 is ttyo, used by the KL11 TX)
         .data     = clk,

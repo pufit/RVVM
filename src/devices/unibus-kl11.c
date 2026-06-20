@@ -48,7 +48,10 @@ PUSH_OPTIMIZATION_SIZE
 #define DL11_DONE 0x80 // bit 7: Done / Ready
 #define DL11_IE   0x40 // bit 6: Interrupt Enable
 
-#define DL11_BR        5    // processor level 5 (u0.s tty vectors ;240)
+#define DL11_BR        UNIBUS_BR4 // KL11/DL11 console requests on BR4 (Fourth
+                                  // Edition low.s "klin; br4 / klou; br4").
+                                  // The ;240 in u0.s "ttyi;240" is the ISR's
+                                  // new-PS / run level 5, NOT the bus line.
 #define DL11_RX_VECTOR 0060 // receiver interrupt vector
 #define DL11_TX_VECTOR 0064 // transmitter interrupt vector
 

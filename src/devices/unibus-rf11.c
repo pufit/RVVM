@@ -34,8 +34,10 @@ dae, dar, bus address, word count, then dcs):
 The kernel writes dcs = 0103 (write+GO+IE) or 0105 (read+GO+IE)
 (u8.s "prf:" -> "$103 ... write", "$105 ... read").
 
-Interrupt: BR6 / processor level 6, vector 0204 (build/u0.s ". = orig+204
-... drum;300", i.e. priority 300 = level 6, vector at offset 204).
+Interrupt: bus request BR5 (the RF11's hardwired Unibus level), vector 0204.
+The ISR *runs* at processor level 6 -- build/u0.s ". = orig+204 ... drum;300"
+encodes 300 (level 6) as the vector's new-PS, which is the run level, NOT the
+bus-request line; do not conflate the two (cf. the KW11-L clock).
 Handbook Appendix A (p.A-1) lists the RF11 CSR family in the I/O page; the
 1st Edition UNIX vector table is the binding contract honored here.
 
@@ -64,7 +66,10 @@ PUSH_OPTIMIZATION_SIZE
 #define RF11_DCS_READY 0x0080 // bit 7: ready / done
 #define RF11_DCS_ERR   0x8000 // bit 15: error
 
-#define RF11_BR        6    // processor level 6 (u0.s drum;300)
+#define RF11_BR        UNIBUS_BR5 // RF11 controller requests on BR5 (its
+                                  // hardwired bus line). The 300 in u0.s
+                                  // "drum;300" is the ISR's new-PS / run
+                                  // level 6, NOT the bus-request line.
 #define RF11_VECTOR    0204 // drum interrupt vector (u0.s . = orig+204)
 
 // Register offsets within the block based at dcs = 0177460

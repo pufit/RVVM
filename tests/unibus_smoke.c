@@ -11,14 +11,15 @@ Builds against librvvm using only its public ABI. It:
 
   1. Creates a machine and installs a recording interrupt controller that
      captures the level of the single RISC-V external IRQ line.
-  2. Attaches a Unibus (MB == 0) and a KW11-L line clock (BR7, vector 064).
+  2. Attaches a Unibus (MB == 0) and a KW11-L line clock (BR6, vector 0100).
   3. Runs a tiny hand-encoded RV64 firmware that enables the clock's
      interrupt by writing the IE bit to LKS (0177546) over real MMIO, then
      signals readiness in RAM and spins.
   4. Forces a line tick and verifies:
        - the bus asserts the RISC-V external IRQ line (recording intc), and
-       - unibus_ack(P=0) returns vector 064 (the granted clock interrupt),
-       - unibus_ack(P=7) returns 0 (level 7 is not strictly above P=7),
+       - unibus_ack(P=5) returns vector 0100 (the granted clock interrupt),
+       - unibus_ack(P=6) returns 0 (BR6 is not strictly above P=6, so the
+         clock cannot preempt an spl6 critical section),
      matching the IAK / BR-priority contract in unibus.h.
 
 Build (from the repo root, after `make USE_LIB=1 lib`):
@@ -159,18 +160,23 @@ int main(void)
     rvvm_kw11l_tick(clk);
     check("bus raised RISC-V IRQ after tick", g_irq_level == 1);
 
-    // IAK at P=7: BR7 is not strictly greater than 7, so nothing is granted.
-    check("IAK P>=7 grants nothing", unibus_ack(bus, 7) == 0);
+    // The clock requests on BR6 (the KW11-L's hardwired level; the 340 in
+    // u0.s "clock;340" is the ISR run-PS, not the bus-request line). The IAK
+    // grant rule is "device level STRICTLY greater than P", so:
+    //   P=7 -> 6 > 7 false  -> nothing (request still pending)
+    //   P=6 -> 6 > 6 false  -> nothing: this is the guarantee the kernel's
+    //                          spl6 critical sections (u3.s swap, u4.s runq)
+    //                          rely on -- a BR6 clock cannot preempt spl6.
+    //   P=5 -> 6 > 5 true   -> granted, vector 0100, request cleared.
+    check("IAK P=7 grants nothing (6 !> 7)", unibus_ack(bus, 7) == 0);
+    check("IAK P=6 grants nothing (spl6 masks the clock)", unibus_ack(bus, 6) == 0);
 
-    // IAK at P=0: the clock (BR7) outranks P, grant returns vector 0100
-    // (1st Edition UNIX's u0.s vector table puts the clock at 0100; see
-    // unibus-kw11l.c).
-    uint16_t vec = unibus_ack(bus, 0);
-    check("IAK P=0 grants clock vector 0100", vec == 0100);
+    uint16_t vec = unibus_ack(bus, 5);
+    check("IAK P=5 grants clock vector 0100 (6 > 5)", vec == 0100);
 
-    // The grant cleared the request, so a second IAK grants nothing and the
+    // The grant cleared the request, so a further IAK grants nothing and the
     // bus drops the RISC-V line.
-    check("second IAK grants nothing", unibus_ack(bus, 0) == 0);
+    check("post-grant IAK grants nothing", unibus_ack(bus, 0) == 0);
     check("RISC-V IRQ dropped after grant", g_irq_level == 0);
 
     rvvm_pause_machine(machine);

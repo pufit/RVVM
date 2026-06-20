@@ -159,17 +159,21 @@ matching the Unibus where any device may arbitrate for NPR.
 ## Per-device register / vector / BR-level table
 
 Addresses are the kernel's I/O-page octal addresses
-(`unix-v1-on-rvvm/port/include/io.inc`); levels and vectors are from the
-kernel's low-memory vector table (`unix-v1-on-rvvm/build/u0.s`). Handbook
-Appendix A fixed assignments are noted where they differ; the **kernel's
-table is the binding contract** honored by the code.
+(`unix-v1-on-rvvm/port/include/io.inc`); vectors are from the kernel's
+low-memory vector table (`unix-v1-on-rvvm/build/u0.s`). The **BR level is the
+device's real hardwired Unibus bus-request line** (per DEC / SIMH / Fourth
+Edition `low.s`), NOT the `;NNN` new-PS in `u0.s` — that new-PS is the
+priority the ISR *runs at* (shown in parentheses), a software choice that can
+and does differ between editions. Conflating the two is a bug (it mis-ranks
+IAK arbitration); see `unibus-kw11l.c`. The kernel's vector table is the
+binding contract for addresses/vectors.
 
 | Device | Register(s) (octal) | BR level | Vector (octal) | Status | Handbook ref |
 |--------|---------------------|----------|----------------|--------|--------------|
-| KW11-L line clock | `lks` 0177546 | BR7 (level 340) | 064 | **working** | App.A p.A-1 (CSR 777546), p.A-5 (App.A fixed vector 100; kernel uses 064); LTC p.271 |
-| KL11/DL11 console RX | `tks` 0177560 / `tkb` 0177562 | BR5 (level 240) | 060 | **working** | App.A p.A-1 ("DL/DLV11 777560 … console"); Done/IE p.215 |
-| KL11/DL11 console TX | `tps` 0177564 / `tpb` 0177566 | BR5 (level 240) | 064 | **working** | App.A p.A-1; vector pass p.269 |
-| RF11/RS11 drum | `dcs` 0177460, `wc` 0177462, `cma` 0177464, `dar` 0177466, `dae` 0177470 | BR6 (level 300) | 0204 | **working** | NPR/DMA p.268; CSR family App.A p.A-1 |
+| KW11-L line clock | `lks` 0177546 | BR6 (ISR runs at PS 340) | 0100 | **working** | App.A p.A-1 (CSR 777546), p.A-5 (vector 100); LTC p.271 |
+| KL11/DL11 console RX | `tks` 0177560 / `tkb` 0177562 | BR4 (ISR runs at PS 240) | 060 | **working** | App.A p.A-1 ("DL/DLV11 777560 … console"); Done/IE p.215 |
+| KL11/DL11 console TX | `tps` 0177564 / `tpb` 0177566 | BR4 (ISR runs at PS 240) | 064 | **working** | App.A p.A-1; vector pass p.269 |
+| RF11/RS11 drum | `dcs` 0177460, `wc` 0177462, `cma` 0177464, `dar` 0177466, `dae` 0177470 | BR5 (ISR runs at PS 300) | 0204 | **working** | NPR/DMA p.268; CSR family App.A p.A-1 |
 | RK11 disk | `rkds` 0177400 … `rkda` 0177412 | BR6 (level 300) | 0214 | *not implemented* | App.A p.A-1 |
 | TC11 DECtape | `tcst` 0177340 … `tcdt` 0177350 | BR6 (level 300) | 0214 | *not implemented* | App.A p.A-1 |
 | DC11 serial lines | 0174000.. | BR5 | 0300.. | *not implemented* | App.A p.A-1 ("DC11 774000") |

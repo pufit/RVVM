@@ -25,10 +25,10 @@ Handbook = "PDP-11 Architecture Handbook" (DEC, 1983), printed page numbers.
 #include "unibus.h"
 
 /*
- * KW11-L line time clock (lks = 0177546, BR7, vector 064).
+ * KW11-L line time clock (lks = 0177546, BR6, vector 0100).
  *
  * line_hz is the AC line frequency in Hz (60 US / 50 EU); 0 selects 60.
- * Ticks at line frequency, setting the Monitor bit and raising a BR7
+ * Ticks at line frequency, setting the Monitor bit and raising a BR6
  * interrupt when interrupt-enable is set. See unibus-kw11l.c.
  */
 PUBLIC unibus_dev_t* rvvm_kw11l_init(unibus_t* bus, uint64_t line_hz);
@@ -37,7 +37,7 @@ PUBLIC unibus_dev_t* rvvm_kw11l_init(unibus_t* bus, uint64_t line_hz);
 PUBLIC void rvvm_kw11l_tick(unibus_dev_t* dev);
 
 /*
- * KL11/DL11 console (tks/tkb/tps/tpb @ 0177560, BR5, vectors 060/064).
+ * KL11/DL11 console (tks/tkb/tps/tpb @ 0177560, BR4, vectors 060/064).
  *
  * PIO character device wired to an RVVM chardev backend (like ns16550a).
  * Receiver done -> RX interrupt (vector 060); transmitter ready -> TX
@@ -49,7 +49,7 @@ PUBLIC unibus_dev_t* rvvm_kl11_init(unibus_t* bus, chardev_t* chardev);
 
 /*
  * RF11/RS11 fixed-head disk ("drum"), the root+swap device
- * (dcs = 0177460, BR6, vector 0204). NPR block DMA between a backing image
+ * (dcs = 0177460, BR5, vector 0204). NPR block DMA between a backing image
  * and the window RAM. See unibus-rf11.c.
  *
  * image_size_blocks is the drum size in 512-byte blocks; backing is an
