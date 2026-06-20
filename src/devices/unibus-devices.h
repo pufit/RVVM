@@ -58,6 +58,16 @@ PUBLIC unibus_dev_t* rvvm_kl11_init(unibus_t* bus, chardev_t* chardev);
 PUBLIC unibus_dev_t* rvvm_rf11_init(unibus_t* bus, size_t image_size_blocks);
 
 /*
+ * RK11/RK05 cartridge disk (rkds = 0177400, BR5, vector 0220). NPR block DMA
+ * between an in-memory pack image and the window RAM. See unibus-rk11.c.
+ *
+ * image_size_blocks is the pack size in 512-byte blocks; 0 selects the RK05
+ * default of 4872 blocks (203 cylinders x 2 surfaces x 12 sectors).
+ */
+PUBLIC unibus_dev_t* rvvm_rk11_init(unibus_t* bus, size_t image_size_blocks);
+PUBLIC bool          rvvm_rk11_load(unibus_dev_t* dev, const void* data, size_t len);
+
+/*
  * Convenience: attach a Unibus (MB == 0) populated with the standard 1st
  * Edition UNIX device set -- KW11-L clock, KL11 console (on a stdio
  * terminal) and RF11 drum. Mirrors pci_bus_init_auto() for the PCI side.

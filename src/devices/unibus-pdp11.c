@@ -40,6 +40,9 @@ PUBLIC unibus_t* unibus_pdp11_init_auto(rvvm_machine_t* machine)
     // RF11/RS11 drum: 1024 blocks (1st Edition UNIX root+swap).
     rvvm_rf11_init(bus, 1024);
 
+    // RK11/RK05 cartridge disk (empty pack; image via rvvm_rk11_load).
+    rvvm_rk11_init(bus, 0);
+
     return bus;
 }
 
