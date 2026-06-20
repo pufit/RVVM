@@ -212,13 +212,18 @@ void riscv_breakpoint(rvvm_hart_t* vm)
     if (vm->machine->dbg_bp && vm->registers[RISCV_REG_PC] == vm->machine->dbg_bp) {
         if (vm->machine->dbg_skip) {
             // Step over this hit: re-emulate the original instruction (advancing
-            // PC by its size) and keep running, leaving the breakpoint patched.
+            // PC by its size), leaving the breakpoint patched. riscv_emulate_insn
+            // advances PC *after* the (c.)ebreak handler returns, so pre-subtract
+            // the ebreak's own size to cancel that outer advance -- otherwise an
+            // instruction would be skipped.
+            uint32_t ebreak_size = ((vm->machine->dbg_orig & 0x3) != 0x3) ? 2 : 4;
             vm->machine->dbg_skip--;
             if (vm->rv64) {
                 riscv64_dbg_step_insn(vm, vm->machine->dbg_orig);
             } else {
                 riscv32_dbg_step_insn(vm, vm->machine->dbg_orig);
             }
+            vm->registers[RISCV_REG_PC] -= ebreak_size;
             return;
         }
         // Latch the PC and pause so the host can inspect registers/memory.
