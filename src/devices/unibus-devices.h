@@ -68,6 +68,17 @@ PUBLIC unibus_dev_t* rvvm_rk11_init(unibus_t* bus, size_t image_size_blocks);
 PUBLIC bool          rvvm_rk11_load(unibus_dev_t* dev, const void* data, size_t len);
 
 /*
+ * PC11 paper-tape reader/punch (prs/prb @ 0177550, pps/ppb @ 0177554, BR4,
+ * vectors 070 reader / 074 punch). PIO character device with two independent
+ * interrupt sources and no chardev backend: the reader consumes a mounted
+ * tape image sequentially; the punch appends to an in-memory output buffer.
+ * See unibus-pc11.c.
+ */
+PUBLIC unibus_dev_t* rvvm_pc11_init(unibus_t* bus);
+PUBLIC bool          rvvm_pc11_load_reader(unibus_dev_t* dev, const void* data, size_t len);
+PUBLIC size_t        rvvm_pc11_punch_data(unibus_dev_t* dev, void* out, size_t n);
+
+/*
  * Convenience: attach a Unibus (MB == 0) populated with the standard 1st
  * Edition UNIX device set -- KW11-L clock, KL11 console (on a stdio
  * terminal) and RF11 drum. Mirrors pci_bus_init_auto() for the PCI side.

@@ -43,6 +43,9 @@ PUBLIC unibus_t* unibus_pdp11_init_auto(rvvm_machine_t* machine)
     // RK11/RK05 cartridge disk (empty pack; image via rvvm_rk11_load).
     rvvm_rk11_init(bus, 0);
 
+    // PC11 paper-tape reader/punch (no tape; mount via rvvm_pc11_load_reader).
+    rvvm_pc11_init(bus);
+
     return bus;
 }
 
