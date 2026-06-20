@@ -91,6 +91,17 @@ PUBLIC unibus_dev_t* rvvm_tc11_init(unibus_t* bus, size_t image_size_blocks);
 PUBLIC bool          rvvm_tc11_load(unibus_dev_t* dev, const void* data, size_t len);
 
 /*
+ * DC11 asynchronous serial multiplexer: nlines full-duplex lines, each with
+ * its own receiver + transmitter and independent vectors. Line i registers at
+ * 0174000 + i*010 (rcsr/rcbr/tcsr/tcbr); RX vector 0300 + i*010, TX vector
+ * +4; BR5. Each line is backed by an optional chardev (NULL => idle: RX never
+ * ready, TX always ready). nlines == 0 defaults to 8 (what the kernel wires).
+ * See unibus-dc11.c.
+ */
+PUBLIC unibus_dev_t* rvvm_dc11_init(unibus_t* bus, size_t nlines);
+PUBLIC bool          rvvm_dc11_set_chardev(unibus_dev_t* dev, size_t line, chardev_t* chardev);
+
+/*
  * Convenience: attach a Unibus (MB == 0) populated with the standard 1st
  * Edition UNIX device set -- KW11-L clock, KL11 console (on a stdio
  * terminal) and RF11 drum. Mirrors pci_bus_init_auto() for the PCI side.

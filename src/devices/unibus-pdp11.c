@@ -49,6 +49,10 @@ PUBLIC unibus_t* unibus_pdp11_init_auto(rvvm_machine_t* machine)
     // TC11/TU56 DECtape (empty reel; image via rvvm_tc11_load).
     rvvm_tc11_init(bus, 0);
 
+    // DC11 8-line async serial multiplexer (all lines idle; attach a backend
+    // to a line via rvvm_dc11_set_chardev).
+    rvvm_dc11_init(bus, 8);
+
     return bus;
 }
 
