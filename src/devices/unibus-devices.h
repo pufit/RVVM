@@ -104,7 +104,8 @@ PUBLIC bool          rvvm_dc11_set_chardev(unibus_dev_t* dev, size_t line, chard
 /*
  * Convenience: attach a Unibus (MB == 0) populated with the standard 1st
  * Edition UNIX device set -- KW11-L clock, KL11 console (on a stdio
- * terminal) and RF11 drum. Mirrors pci_bus_init_auto() for the PCI side.
+ * terminal), RF11 drum, RK11 disk, PC11 paper-tape, TC11 DECtape and an
+ * 8-line DC11 serial mux. Mirrors pci_bus_init_auto() for the PCI side.
  * Returns the bus, or NULL on failure. Not wired into the default machine
  * boot; intended for an explicit CLI/option path.
  */

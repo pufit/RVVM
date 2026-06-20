@@ -45,6 +45,11 @@ extern uint16_t      unibus_ack(unibus_t* bus, uint32_t prio);
 extern unibus_dev_t* rvvm_kw11l_init(unibus_t* bus, uint64_t line_hz);
 extern void          rvvm_kw11l_tick(unibus_dev_t* dev);
 extern unibus_dev_t* rvvm_rf11_init(unibus_t* bus, size_t image_size_blocks);
+extern unibus_dev_t* rvvm_kl11_init(unibus_t* bus, void* chardev);
+extern unibus_dev_t* rvvm_rk11_init(unibus_t* bus, size_t image_size_blocks);
+extern unibus_dev_t* rvvm_pc11_init(unibus_t* bus);
+extern unibus_dev_t* rvvm_tc11_init(unibus_t* bus, size_t image_size_blocks);
+extern unibus_dev_t* rvvm_dc11_init(unibus_t* bus, size_t nlines);
 
 // PDP-11 window addresses (MB == 0)
 #define LKS_ADDR     0xFF66 // lks = 0177546
@@ -226,6 +231,31 @@ int main(void)
         check("NPR DMA write to window RAM", ok && memcmp(check_buf, pattern, sizeof(check_buf)) == 0);
 
         rvvm_free_machine(dm);
+    }
+
+    // --- Full PDP-11 device set coexists on one bus -------------------------
+    //
+    // Turning on RK11/PC11/TC11/DC11 alongside the clock/console/drum must not
+    // collide in the I/O page or overrun it (the bus rejects any overlapping
+    // attach). Build the whole set on one bus -- ~24 register endpoints plus
+    // the 16 DC11 line endpoints -- and require every attach to succeed. The
+    // console is given a NULL chardev so the test stays headless.
+    {
+        rvvm_machine_t* fm = rvvm_create_machine(0xE000, 1, "rv64i");
+        rvvm_set_opt(fm, RVVM_OPT_MEM_BASE, 0x0);
+        rvvm_set_intc(fm, rvvm_irq_dev_init(&rec_intc_cb, NULL));
+        unibus_t* fbus = unibus_init(fm, 0x0);
+        check("full set: bus", fbus != NULL);
+
+        check("full set: KW11-L clock", rvvm_kw11l_init(fbus, 0) != NULL);
+        check("full set: KL11 console", rvvm_kl11_init(fbus, NULL) != NULL);
+        check("full set: RF11 drum",    rvvm_rf11_init(fbus, 1024) != NULL);
+        check("full set: RK11 disk",    rvvm_rk11_init(fbus, 0) != NULL);
+        check("full set: PC11 tape",    rvvm_pc11_init(fbus) != NULL);
+        check("full set: TC11 DECtape", rvvm_tc11_init(fbus, 0) != NULL);
+        check("full set: DC11 x8 mux",  rvvm_dc11_init(fbus, 8) != NULL);
+
+        rvvm_free_machine(fm);
     }
 
     printf("\n%s (%d failure%s)\n", g_failures ? "SMOKE TEST FAILED" : "SMOKE TEST PASSED",
