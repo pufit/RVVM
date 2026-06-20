@@ -208,12 +208,44 @@ void riscv_breakpoint(rvvm_hart_t* vm)
             return;
         }
     }
+    // Host-side debug breakpoint (rvvm_dbg_set_breakpoint): latch the PC and
+    // pause this hart so the host can inspect registers/memory, rather than
+    // delivering the breakpoint trap to the guest.
+    if (vm->machine->dbg_bp && vm->registers[RISCV_REG_PC] == vm->machine->dbg_bp) {
+        vm->machine->dbg_hit = vm->machine->dbg_bp;
+        riscv_restart_at_pc(vm, vm->registers[RISCV_REG_PC]);
+        riscv_hart_queue_pause(vm);
+        return;
+    }
     riscv_trap(vm, RISCV_TRAP_BREAKPOINT, 0);
 }
 
 void riscv_restart_dispatch(rvvm_hart_t* vm)
 {
     atomic_store_uint32_ex(&vm->running, false, ATOMIC_RELAXED);
+}
+
+// Host-side debug breakpoint. Patches an ebreak at vaddr (JIT-coherently via
+// the debug MMU path) and arms the machine so riscv_breakpoint() pauses hart 0
+// there instead of trapping the guest. One-shot inspection aid for the harness;
+// read the hit PC with rvvm_dbg_breakpoint_hit().
+PUBLIC bool rvvm_dbg_set_breakpoint(rvvm_machine_t* machine, rvvm_addr_t vaddr)
+{
+    if (!machine || !vector_size(machine->harts)) {
+        return false;
+    }
+    rvvm_hart_t* vm     = vector_at(machine->harts, 0);
+    uint32_t     ebreak = 0x00100073; // ebreak
+    machine->dbg_bp  = vaddr;
+    machine->dbg_hit = 0;
+    return !!riscv_mmu_op_helper(vm, vaddr, &ebreak, RISCV_MMU_ATTR_DEBUG,
+                                 sizeof(ebreak), RISCV_MMU_WRITE);
+}
+
+// Returns the PC at which the armed debug breakpoint fired, or 0 if not yet hit.
+PUBLIC rvvm_addr_t rvvm_dbg_breakpoint_hit(rvvm_machine_t* machine)
+{
+    return machine ? machine->dbg_hit : 0;
 }
 
 static void riscv_hart_notify(rvvm_hart_t* vm)

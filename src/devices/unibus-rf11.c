@@ -93,6 +93,7 @@ typedef struct {
     uint64_t xfers;      // total transfers performed
     uint32_t last_block; // last block transferred
     uint32_t last_func;  // last function (read/write)
+    uint32_t hist[32];   // ring of recent block numbers (debug)
 } rf11_dev_t;
 
 // Re-evaluate the completion interrupt from dcs (Done & IE)
@@ -146,8 +147,9 @@ static void rf11_go(rf11_dev_t* rf)
     atomic_store_uint32_relax(&rf->cma, (uint16_t)(mem_addr + bytes));
     atomic_store_uint32_relax(&rf->wc, 0);
 
+    rf->hist[rf->xfers & 31] = (uint32_t)(word_addr / 256); // block (word_addr may be OOB)
     rf->xfers++;
-    rf->last_block = (uint32_t)(disk_off / RF11_BLOCK_BYTES);
+    rf->last_block = (uint32_t)(word_addr / 256);
     rf->last_func  = func;
 
     uint32_t new_dcs = (dcs & ~(RF11_DCS_GO | RF11_DCS_ERR)) | RF11_DCS_READY;
@@ -237,6 +239,25 @@ RVVM_PUBLIC void rvvm_rf11_stats(unibus_dev_t* dev, uint64_t* xfers,
     if (xfers)      *xfers      = rf->xfers;
     if (last_block) *last_block = rf->last_block;
     if (last_func)  *last_func  = rf->last_func;
+}
+
+// Copy the recent-block ring (most recent last) into out[0..n-1].
+RVVM_PUBLIC size_t rvvm_rf11_history(unibus_dev_t* dev, uint32_t* out, size_t n)
+{
+    if (!dev) {
+        return 0;
+    }
+    rf11_dev_t* rf = unibus_dev_data(dev);
+    size_t total = rf->xfers < 32 ? (size_t)rf->xfers : 32;
+    if (n > total) {
+        n = total;
+    }
+    for (size_t i = 0; i < n; i++) {
+        // walk back from the most recent
+        size_t idx = (rf->xfers - n + i) & 31;
+        out[i] = rf->hist[idx];
+    }
+    return n;
 }
 
 // Load an initial drum image (root + swap) into the backing store. Bytes past

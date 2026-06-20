@@ -306,6 +306,12 @@ struct randomize_layout rvvm_machine_t {
 
     gdb_server_t* gdbstub;
 
+    // Lightweight host-side debug breakpoint (rvvm_dbg_* API). dbg_bp is the
+    // armed virtual address (0 = none); on ebreak there, the hart pauses and
+    // dbg_hit latches the PC for the host to read, instead of trapping to guest.
+    rvvm_addr_t dbg_bp;
+    rvvm_addr_t dbg_hit;
+
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
 
 #if defined(USE_FDT)
