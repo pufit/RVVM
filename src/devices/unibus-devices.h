@@ -79,6 +79,18 @@ PUBLIC bool          rvvm_pc11_load_reader(unibus_dev_t* dev, const void* data, 
 PUBLIC size_t        rvvm_pc11_punch_data(unibus_dev_t* dev, void* out, size_t n);
 
 /*
+ * TC11/TU56 DECtape (tcst = 0177340, BR6, vector 0214). NPR block DMA between
+ * an in-memory tape image and the window RAM; the driver searches (reads the
+ * block number) to position the head, then issues a READ/WRITE data transfer.
+ * See unibus-tc11.c.
+ *
+ * image_size_blocks is the tape size in 512-byte (256-word) blocks; 0 selects
+ * the TU56 default of 578 blocks.
+ */
+PUBLIC unibus_dev_t* rvvm_tc11_init(unibus_t* bus, size_t image_size_blocks);
+PUBLIC bool          rvvm_tc11_load(unibus_dev_t* dev, const void* data, size_t len);
+
+/*
  * Convenience: attach a Unibus (MB == 0) populated with the standard 1st
  * Edition UNIX device set -- KW11-L clock, KL11 console (on a stdio
  * terminal) and RF11 drum. Mirrors pci_bus_init_auto() for the PCI side.

@@ -21,6 +21,7 @@ at the bottom of the page; the PDF page index is +9).
 | `src/devices/unibus-rf11.c` | RF11/RS11 "drum" — NPR block DMA (fully working) |
 | `src/devices/unibus-rk11.c` | RK11/RK05 cartridge disk — NPR block DMA (fully working) |
 | `src/devices/unibus-pc11.c` | PC11 paper-tape reader/punch — PIO, two IRQ sources (fully working) |
+| `src/devices/unibus-tc11.c` | TC11/TU56 DECtape — NPR block DMA, search/read/write (fully working) |
 | `tests/unibus_smoke.c` | Self-contained librvvm smoke test (real-MMIO + IAK contract) |
 
 ## The window / MB model
@@ -179,7 +180,7 @@ binding contract for addresses/vectors.
 | PC11 paper-tape punch | `pps` 0177554 / `ppb` 0177556 | BR4 (ISR runs at PS 240) | 074 | **working** | App.A p.A-1 ("PC11") |
 | RF11/RS11 drum | `dcs` 0177460, `wc` 0177462, `cma` 0177464, `dar` 0177466, `dae` 0177470 | BR5 (ISR runs at PS 300) | 0204 | **working** | NPR/DMA p.268; CSR family App.A p.A-1 |
 | RK11/RK05 disk | `rkds` 0177400, `rker` 0177402, `rkcs` 0177404, `rkwc` 0177406, `rkba` 0177410, `rkda` 0177412 | BR5 (ISR runs at PS 300) | 0220 | **working** | NPR/DMA p.268; CSR family App.A p.A-1 |
-| TC11 DECtape | `tcst` 0177340 … `tcdt` 0177350 | BR6 (level 300) | 0214 | *not implemented* | App.A p.A-1 |
+| TC11/TU56 DECtape | `tcst` 0177340, `tccm` 0177342, `tcwc` 0177344, `tcba` 0177346, `tcdt` 0177350 | BR6 (ISR runs at PS 300) | 0214 | **working** | NPR/DMA p.268; CSR family App.A p.A-1 |
 | DC11 serial lines | 0174000.. | BR5 | 0300.. | *not implemented* | App.A p.A-1 ("DC11 774000") |
 
 Notes:

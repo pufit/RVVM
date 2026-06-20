@@ -46,6 +46,9 @@ PUBLIC unibus_t* unibus_pdp11_init_auto(rvvm_machine_t* machine)
     // PC11 paper-tape reader/punch (no tape; mount via rvvm_pc11_load_reader).
     rvvm_pc11_init(bus);
 
+    // TC11/TU56 DECtape (empty reel; image via rvvm_tc11_load).
+    rvvm_tc11_init(bus, 0);
+
     return bus;
 }
 
