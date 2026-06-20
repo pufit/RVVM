@@ -15,9 +15,20 @@ file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #if defined(RISCV64)
 #define riscv_run_interpreter func_opt_hot riscv64_run_interpreter
+#define riscv_dbg_step_insn   riscv64_dbg_step_insn
 #elif defined(RISCV32)
 #define riscv_run_interpreter riscv32_run_interpreter
+#define riscv_dbg_step_insn   riscv32_dbg_step_insn
 #endif
+
+// Host-debug helper: emulate a single given instruction at the current PC,
+// advancing PC by its size. Used by the breakpoint skip path (riscv_hart.c) to
+// step over a patched ebreak by re-running the original instruction, without
+// touching the patched memory. Exposes the static interpreter emulate().
+void riscv_dbg_step_insn(rvvm_hart_t* vm, uint32_t insn)
+{
+    riscv_emulate_insn(vm, insn);
+}
 
 /*
  * Optimized CPU interpreter dispatch loop.

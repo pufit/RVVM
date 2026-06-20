@@ -88,6 +88,10 @@ void riscv_trap(rvvm_hart_t* vm, bitcnt_t cause, rvvm_uxlen_t tval);
 // Execute a breakpoint. Reports each breakpoint to GDB stub once
 void riscv_breakpoint(rvvm_hart_t* vm);
 
+// Host-debug: emulate a single instruction (per-XLEN; see riscv_interpreter.h).
+void riscv64_dbg_step_insn(rvvm_hart_t* vm, uint32_t insn);
+void riscv32_dbg_step_insn(rvvm_hart_t* vm, uint32_t insn);
+
 /*
  * Running the hart
  */

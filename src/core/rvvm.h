@@ -307,10 +307,14 @@ struct randomize_layout rvvm_machine_t {
     gdb_server_t* gdbstub;
 
     // Lightweight host-side debug breakpoint (rvvm_dbg_* API). dbg_bp is the
-    // armed virtual address (0 = none); on ebreak there, the hart pauses and
-    // dbg_hit latches the PC for the host to read, instead of trapping to guest.
+    // armed virtual address (0 = none); on the patched (c.)ebreak there, the
+    // hart pauses and dbg_hit latches the PC for the host to read, instead of
+    // trapping to guest. dbg_skip hits are stepped over first (the saved
+    // original instruction dbg_orig is re-emulated), giving multi-hit support.
     rvvm_addr_t dbg_bp;
     rvvm_addr_t dbg_hit;
+    uint32_t    dbg_orig; // Original instruction bytes at dbg_bp
+    uint32_t    dbg_skip; // Remaining hits to step over before pausing
 
     rvvm_addr_t opts[RVVM_OPTS_ARR_SIZE];
 

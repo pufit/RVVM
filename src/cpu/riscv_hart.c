@@ -208,10 +208,20 @@ void riscv_breakpoint(rvvm_hart_t* vm)
             return;
         }
     }
-    // Host-side debug breakpoint (rvvm_dbg_set_breakpoint): latch the PC and
-    // pause this hart so the host can inspect registers/memory, rather than
-    // delivering the breakpoint trap to the guest.
+    // Host-side debug breakpoint (rvvm_dbg_set_breakpoint).
     if (vm->machine->dbg_bp && vm->registers[RISCV_REG_PC] == vm->machine->dbg_bp) {
+        if (vm->machine->dbg_skip) {
+            // Step over this hit: re-emulate the original instruction (advancing
+            // PC by its size) and keep running, leaving the breakpoint patched.
+            vm->machine->dbg_skip--;
+            if (vm->rv64) {
+                riscv64_dbg_step_insn(vm, vm->machine->dbg_orig);
+            } else {
+                riscv32_dbg_step_insn(vm, vm->machine->dbg_orig);
+            }
+            return;
+        }
+        // Latch the PC and pause so the host can inspect registers/memory.
         vm->machine->dbg_hit = vm->machine->dbg_bp;
         riscv_restart_at_pc(vm, vm->registers[RISCV_REG_PC]);
         riscv_hart_queue_pause(vm);
@@ -225,21 +235,37 @@ void riscv_restart_dispatch(rvvm_hart_t* vm)
     atomic_store_uint32_ex(&vm->running, false, ATOMIC_RELAXED);
 }
 
-// Host-side debug breakpoint. Patches an ebreak at vaddr (JIT-coherently via
-// the debug MMU path) and arms the machine so riscv_breakpoint() pauses hart 0
-// there instead of trapping the guest. One-shot inspection aid for the harness;
-// read the hit PC with rvvm_dbg_breakpoint_hit().
-PUBLIC bool rvvm_dbg_set_breakpoint(rvvm_machine_t* machine, rvvm_addr_t vaddr)
+// Host-side debug breakpoint. Patches a (c.)ebreak at vaddr -- JIT-coherently
+// via the debug MMU path -- so riscv_breakpoint() pauses hart 0 there instead
+// of trapping the guest. The first `skip` hits are stepped over (the original
+// instruction is re-emulated), so it pauses on hit number skip+1; read the hit
+// PC with rvvm_dbg_breakpoint_hit(). The patch matches the original
+// instruction's size (2-byte c.ebreak / 4-byte ebreak) so stepping over lands
+// on the correct next instruction.
+PUBLIC bool rvvm_dbg_set_breakpoint(rvvm_machine_t* machine, rvvm_addr_t vaddr, uint32_t skip)
 {
     if (!machine || !vector_size(machine->harts)) {
         return false;
     }
-    rvvm_hart_t* vm     = vector_at(machine->harts, 0);
-    uint32_t     ebreak = 0x00100073; // ebreak
-    machine->dbg_bp  = vaddr;
-    machine->dbg_hit = 0;
-    return !!riscv_mmu_op_helper(vm, vaddr, &ebreak, RISCV_MMU_ATTR_DEBUG,
-                                 sizeof(ebreak), RISCV_MMU_WRITE);
+    rvvm_hart_t* vm   = vector_at(machine->harts, 0);
+    uint32_t     orig = 0;
+    if (!riscv_mmu_op_helper(vm, vaddr, &orig, RISCV_MMU_ATTR_DEBUG, 4, RISCV_MMU_READ)) {
+        return false;
+    }
+    machine->dbg_bp   = vaddr;
+    machine->dbg_hit  = 0;
+    machine->dbg_skip = skip;
+
+    bool compressed = (orig & 0x3) != 0x3;
+    if (compressed) {
+        machine->dbg_orig = orig & 0xFFFF;       // 2-byte original
+        uint32_t cebreak  = 0x9002;              // c.ebreak
+        return !!riscv_mmu_op_helper(vm, vaddr, &cebreak, RISCV_MMU_ATTR_DEBUG, 2, RISCV_MMU_WRITE);
+    } else {
+        machine->dbg_orig = orig;                // 4-byte original
+        uint32_t ebreak   = 0x00100073;          // ebreak
+        return !!riscv_mmu_op_helper(vm, vaddr, &ebreak, RISCV_MMU_ATTR_DEBUG, 4, RISCV_MMU_WRITE);
+    }
 }
 
 // Returns the PC at which the armed debug breakpoint fired, or 0 if not yet hit.
