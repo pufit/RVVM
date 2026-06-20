@@ -279,6 +279,23 @@ PUBLIC rvvm_addr_t rvvm_dbg_breakpoint_hit(rvvm_machine_t* machine)
     return machine ? machine->dbg_hit : 0;
 }
 
+// Resume past the currently-latched breakpoint hit, stepping over `skip`
+// further hits before pausing again. Unlike rvvm_dbg_set_breakpoint() this
+// does NOT touch guest memory -- the (c.)ebreak is already patched and
+// dbg_orig already holds the true original instruction -- so it is safe to
+// call while paused AT the breakpoint (where the patched memory would
+// otherwise be misread as the original). Used to trace every hit in one run:
+// inspect regs, then continue with skip=0 to stop at the very next hit.
+PUBLIC void rvvm_dbg_continue(rvvm_machine_t* machine, uint32_t skip)
+{
+    if (!machine || !machine->dbg_bp) {
+        return;
+    }
+    // +1 to step over the hit we are currently paused on.
+    machine->dbg_skip = skip + 1;
+    machine->dbg_hit  = 0;
+}
+
 static void riscv_hart_notify(rvvm_hart_t* vm)
 {
     riscv_restart_dispatch(vm);
