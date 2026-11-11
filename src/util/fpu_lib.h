@@ -2211,4 +2211,61 @@ static forceinline fpu_f64_t fpu_rmm_div64(fpu_f64_t n, fpu_f64_t a, fpu_f64_t b
     return r;
 }
 
+/*
+ * roundTiesToAway fixup for the FMA family. As with the other ops, the base fma
+ * runs in RNE and only an exact halfway tie needs correcting. Both are
+ * flag-isolated like the fixups above.
+ *
+ * f32: widen to f64, where a*b is exact (48 <= 53 bits) and the away-side midpoint
+ * m is exact (<= 25 significant bits, including the subnormal range). The op is an
+ * exact tie iff a*b + c == m, tested as ((a*b + c) - m) == 0 with every term
+ * exact. A subnormal f32 result is covered too: it widens to a normal f64.
+ */
+static forceinline fpu_f32_t fpu_rmm_fma32(fpu_f32_t n, fpu_f32_t a, fpu_f32_t b, fpu_f32_t c)
+{
+    if (unlikely(!fpu_is_finite32(n))) {
+        return n;
+    }
+    const uint32_t  exc   = fpu_get_exceptions();
+    const fpu_f32_t away  = fpu_bit_u32_to_f32(fpu_bit_f32_to_u32(n) + 1);             // toward larger magnitude
+    const fpu_f64_t dab   = fpu_mul64(fpu_fcvt_f32_to_f64(a), fpu_fcvt_f32_to_f64(b)); // exact
+    const fpu_f64_t dc    = fpu_fcvt_f32_to_f64(c);
+    const fpu_f64_t s1    = fpu_add64(dab, dc);
+    const fpu_f64_t s1e   = fpu_add_error64(s1, dab, dc); // exact: dab + dc == s1 + s1e
+    const fpu_f64_t dn    = fpu_fcvt_f32_to_f64(n);
+    const fpu_f64_t half  = fpu_bit_u64_to_f64(0x3FE0000000000000ULL); // 0.5
+    const fpu_f64_t m     = fpu_add64(dn, fpu_mul64(fpu_sub64(fpu_fcvt_f32_to_f64(away), dn), half));
+    const fpu_f64_t resid = fpu_add64(fpu_sub64(s1, m), s1e); // (a*b + c) - m, exactly 0 only on a tie
+    const fpu_f32_t r     = ((fpu_bit_f64_to_u64(resid) << 1) == 0) ? away : n;
+    fpu_set_exceptions(exc);
+    return r;
+}
+
+/*
+ * f64: there is no wider host type, so recover the exact residual a*b + c - n via
+ * the Boldo-Muller error-free FMA (TwoProduct + two TwoSums + a final FastTwoSum),
+ * which splits it into a non-overlapping pair (r2, r3). An exact tie has the
+ * residual equal to +/- half a ULP -- a single float -- so r3 == 0 and r2 is that
+ * half-ULP, exactly the condition fpu_rmm_fixup64 tests.
+ */
+static forceinline fpu_f64_t fpu_rmm_fma64(fpu_f64_t n, fpu_f64_t a, fpu_f64_t b, fpu_f64_t c)
+{
+    if (unlikely(!fpu_is_finite64(n))) {
+        return n;
+    }
+    const uint32_t  exc = fpu_get_exceptions();
+    const fpu_f64_t p   = fpu_mul64(a, b);
+    const fpu_f64_t pe  = fpu_fma64(a, b, fpu_neg64(p)); // TwoProduct tail: a*b == p + pe
+    const fpu_f64_t a1  = fpu_add64(c, pe);
+    const fpu_f64_t a2  = fpu_add_error64(a1, c, pe); // TwoSum(c, pe)
+    const fpu_f64_t b1  = fpu_add64(p, a1);
+    const fpu_f64_t b2  = fpu_add_error64(b1, p, a1); // TwoSum(p, a1)
+    const fpu_f64_t g   = fpu_add64(fpu_sub64(b1, n), b2);
+    const fpu_f64_t r2  = fpu_add64(g, a2); // FastTwoSum(g, a2): residual == r2 + r3
+    const fpu_f64_t r3  = fpu_sub64(a2, fpu_sub64(r2, g));
+    const fpu_f64_t r   = ((fpu_bit_f64_to_u64(r3) << 1) == 0) ? fpu_rmm_fixup64(n, r2) : n;
+    fpu_set_exceptions(exc);
+    return r;
+}
+
 #endif
